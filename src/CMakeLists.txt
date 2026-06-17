@@ -132,7 +132,10 @@ set(SOUFFLE_SOURCES
     ast2ram/seminaive/TranslationStrategy.cpp
     ast2ram/seminaive/UnitTranslator.cpp
     ast2ram/seminaive/ValueTranslator.cpp
+    ast2ram/incremental/ClauseTranslator.cpp
+    ast2ram/incremental/ConstraintTranslator.cpp
     ast2ram/incremental/TranslationStrategy.cpp
+    ast2ram/incremental/UnitTranslator.cpp
     ast2ram/utility/Utils.cpp
     ast2ram/utility/TranslatorContext.cpp
     ast2ram/utility/ValueIndex.cpp

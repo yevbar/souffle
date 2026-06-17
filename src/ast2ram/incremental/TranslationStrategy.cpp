@@ -10,17 +10,21 @@
  *
  * @file TranslationStrategy.cpp
  *
- * Scaffold for the elastic incremental evaluation strategy. Each factory below
- * currently returns the corresponding semi-naive translator, so the RAM (and
- * therefore the output) produced under `--incremental` is identical to the
- * default strategy. The incremental translators replace these one at a time.
+ * The elastic incremental evaluation strategy. The unit and clause
+ * translators are incremental-specific (they add and thread the
+ * @count / @iteration auxiliary columns); the constraint and value
+ * translators are inherited from the semi-naive strategy unchanged.
+ *
+ * With the column VALUES still at their scaffold placeholders, the RAM
+ * (and therefore program output) produced under `--incremental` remains
+ * identical to the default strategy.
  *
  ***********************************************************************/
 
 #include "ast2ram/incremental/TranslationStrategy.h"
-#include "ast2ram/seminaive/ClauseTranslator.h"
-#include "ast2ram/seminaive/ConstraintTranslator.h"
-#include "ast2ram/seminaive/UnitTranslator.h"
+#include "ast2ram/incremental/ClauseTranslator.h"
+#include "ast2ram/incremental/ConstraintTranslator.h"
+#include "ast2ram/incremental/UnitTranslator.h"
 #include "ast2ram/seminaive/ValueTranslator.h"
 #include "ast2ram/utility/TranslatorContext.h"
 #include "ram/Condition.h"
@@ -29,17 +33,17 @@
 namespace souffle::ast2ram::incremental {
 
 ast2ram::UnitTranslator* TranslationStrategy::createUnitTranslator() const {
-    return new seminaive::UnitTranslator();
+    return new incremental::UnitTranslator();
 }
 
 ast2ram::ClauseTranslator* TranslationStrategy::createClauseTranslator(
         const TranslatorContext& context, TranslationMode mode) const {
-    return new seminaive::ClauseTranslator(context, mode);
+    return new incremental::ClauseTranslator(context, mode);
 }
 
 ast2ram::ConstraintTranslator* TranslationStrategy::createConstraintTranslator(
         const TranslatorContext& context, const ValueIndex& index) const {
-    return new seminaive::ConstraintTranslator(context, index);
+    return new incremental::ConstraintTranslator(context, index);
 }
 
 ast2ram::ValueTranslator* TranslationStrategy::createValueTranslator(
