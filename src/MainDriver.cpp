@@ -63,6 +63,7 @@
 #include "ast/transform/UniqueAggregationVariables.h"
 #include "ast2ram/TranslationStrategy.h"
 #include "ast2ram/UnitTranslator.h"
+#include "ast2ram/incremental/TranslationStrategy.h"
 #include "ast2ram/provenance/TranslationStrategy.h"
 #include "ast2ram/provenance/UnitTranslator.h"
 #include "ast2ram/seminaive/TranslationStrategy.h"
@@ -529,10 +530,14 @@ Own<ast::transform::PipelineTransformer> astTransformationPipeline(Global& glb) 
 }
 
 Own<ast2ram::UnitTranslator> getUnitTranslator(Global& glb) {
-    auto translationStrategy =
-            glb.config().has("provenance")
-                    ? mk<ast2ram::TranslationStrategy, ast2ram::provenance::TranslationStrategy>()
-                    : mk<ast2ram::TranslationStrategy, ast2ram::seminaive::TranslationStrategy>();
+    Own<ast2ram::TranslationStrategy> translationStrategy;
+    if (glb.config().has("provenance")) {
+        translationStrategy = mk<ast2ram::TranslationStrategy, ast2ram::provenance::TranslationStrategy>();
+    } else if (glb.config().has("incremental")) {
+        translationStrategy = mk<ast2ram::TranslationStrategy, ast2ram::incremental::TranslationStrategy>();
+    } else {
+        translationStrategy = mk<ast2ram::TranslationStrategy, ast2ram::seminaive::TranslationStrategy>();
+    }
     auto unitTranslator = Own<ast2ram::UnitTranslator>(translationStrategy->createUnitTranslator());
 
     return unitTranslator;
@@ -725,6 +730,9 @@ std::vector<MainOption> getMainOptions() {
           "Enable the frequency counter in the profiler."},
       {"provenance", 't', "[ none | explain | explore ]", "", false,
           "Enable provenance instrumentation and interaction."},
+      {"incremental", nextOptChar++, "", "", false,
+          "Enable elastic incremental evaluation (Bootstrap/Update). Scaffold: currently equivalent to the\n"
+          "default strategy."},
       {"show", nextOptChar++, "[ <see-list> ]", "", true,
           "Print selected program information.\n"
           "Modes:\n"
