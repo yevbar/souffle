@@ -59,6 +59,16 @@ protected:
     Own<ram::Relation> createRamRelation(const ast::Relation* baseRelation, std::string ramRelationName,
             RelationRepresentation) const override;
 
+private:
+    /**
+     * Incremental delta evaluation of a non-recursive relation. Each clause is translated normally, then for
+     * each scan a version is emitted that ranges that one scan over its `diff_plus` and inserts into
+     * `diff_plus_<R>` (a RAM-level relation-name rewrite). The union over scans is exactly the derivations
+     * using at least one newly-inserted tuple. Finally `diff_plus_<R>` is merged into <R>. Only sound for
+     * monotone programs, so the caller gates it on the absence of negation.
+     */
+    Own<ram::Statement> generateIncrementalNonRecursive(const ast::Relation& rel) const;
+
     /** Report the two auxiliary columns to the IO directives so they are stripped on write. */
     void addAuxiliaryArity(
             const ast::Relation* relation, std::map<std::string, std::string>& directives) const override;
