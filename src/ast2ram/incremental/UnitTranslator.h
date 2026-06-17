@@ -61,13 +61,29 @@ protected:
 
 private:
     /**
-     * Incremental delta evaluation of a non-recursive relation. Each clause is translated normally, then for
-     * each scan a version is emitted that ranges that one scan over its `diff_plus` and inserts into
-     * `diff_plus_<R>` (a RAM-level relation-name rewrite). The union over scans is exactly the derivations
-     * using at least one newly-inserted tuple. Finally `diff_plus_<R>` is merged into <R>. Only sound for
-     * monotone programs, so the caller gates it on the absence of negation.
+     * Emit the delta rules for one relation: for each clause and each scan, a version that ranges that scan
+     * over its `diff_plus` and redirects the head insert to `<headPrefix><R>` (a RAM-level relation rename).
+     * The union over scans is the derivations using at least one newly-inserted tuple. `includeRecursive`
+     * controls whether recursive clauses are included (true when seeding a recursive stratum's @delta).
+     */
+    Own<ram::Statement> generateDeltaRules(
+            const ast::Relation& rel, const std::string& headPrefix, bool includeRecursive) const;
+
+    /**
+     * Incremental delta evaluation of a non-recursive relation: the delta rules into `diff_plus_<R>`, then
+     * merge into <R>. Only sound for monotone programs.
      */
     Own<ram::Statement> generateIncrementalNonRecursive(const ast::Relation& rel) const;
+
+    /**
+     * Incremental evaluation of a recursive stratum: seed each relation's @delta with the new tuples (delta
+     * rules into @delta), merge that seed into the full relation, then run the standard semi-naive fixpoint
+     * (which is driven by @delta, so work is proportional to the seed rather than the whole relation), and
+     * conservatively publish the relations into their `diff_plus` for downstream strata. Only sound for
+     * monotone programs.
+     */
+    Own<ram::Statement> generateIncrementalRecursive(
+            const ast::RelationSet& scc, std::size_t sccNumber) const;
 
     /** Report the two auxiliary columns to the IO directives so they are stripped on write. */
     void addAuxiliaryArity(

@@ -25,7 +25,10 @@
 #include "ast/utility/Visitor.h"
 #include "ast2ram/utility/TranslatorContext.h"
 #include "ast2ram/utility/Utils.h"
+#include "ram/Assign.h"
 #include "ram/Insert.h"
+#include "ram/IntrinsicOperator.h"
+#include "ram/Loop.h"
 #include "ram/MergeExtend.h"
 #include "ram/Node.h"
 #include "ram/Query.h"
@@ -34,6 +37,8 @@
 #include "ram/Sequence.h"
 #include "ram/Statement.h"
 #include "ram/TupleElement.h"
+#include "ram/UnsignedConstant.h"
+#include "ram/Variable.h"
 #include "ram/utility/Visitor.h"
 #include "souffle/utility/ContainerUtil.h"
 #include "souffle/utility/MiscUtil.h"
@@ -50,12 +55,14 @@ std::string diffPlusName(const ast::Relation* rel) {
 }
 
 // Rewrites one clause's RAM into a delta version: ranges the `target`-th scan (pre-order) over its diff_plus
-// relation, and redirects every insert into the diff_plus of the head relation. The auxiliary columns are
-// preserved (the tuple shape is unchanged). Profile text is dropped (irrelevant to the delta rule).
+// relation, and redirects every insert to `<headPrefix><head relation>`. The auxiliary columns are preserved
+// (the tuple shape is unchanged). Profile text is dropped (irrelevant to the delta rule).
 struct DeltaRewriter : public ram::NodeMapper {
     std::size_t target;
+    std::string headPrefix;
     mutable std::size_t scanIdx = 0;
-    explicit DeltaRewriter(std::size_t target) : target(target) {}
+    DeltaRewriter(std::size_t target, std::string headPrefix)
+            : target(target), headPrefix(std::move(headPrefix)) {}
 
     Own<ram::Node> operator()(Own<ram::Node> node) const override {
         if (const auto* scan = as<ram::Scan>(node.get())) {
@@ -73,7 +80,7 @@ struct DeltaRewriter : public ram::NodeMapper {
             for (const auto* value : insert->getValues()) {
                 values.push_back(clone(value));
             }
-            return mk<ram::Insert>("diff_plus_" + insert->getRelation(), std::move(values));
+            return mk<ram::Insert>(headPrefix + insert->getRelation(), std::move(values));
         }
         node->apply(*this);
         return node;
@@ -81,10 +88,14 @@ struct DeltaRewriter : public ram::NodeMapper {
 };
 }  // namespace
 
-Own<ram::Statement> UnitTranslator::generateIncrementalNonRecursive(const ast::Relation& rel) const {
+Own<ram::Statement> UnitTranslator::generateDeltaRules(
+        const ast::Relation& rel, const std::string& headPrefix, bool includeRecursive) const {
     VecOwn<ram::Statement> result;
     for (auto&& clause : context->getProgram()->getClauses(rel)) {
-        if (context->isRecursiveClause(clause) || isA<ast::SubsumptiveClause>(clause)) {
+        if (isA<ast::SubsumptiveClause>(clause)) {
+            continue;
+        }
+        if (!includeRecursive && context->isRecursiveClause(clause)) {
             continue;
         }
         // Translate the clause normally (over the real relations, so the analyses are satisfied), then emit
@@ -94,14 +105,59 @@ Own<ram::Statement> UnitTranslator::generateIncrementalNonRecursive(const ast::R
         visit(*base, [&](const ram::Scan&) { numScans++; });
         for (std::size_t i = 0; i < numScans; i++) {
             auto version = clone(base);
-            DeltaRewriter rewriter(i);
+            DeltaRewriter rewriter(i, headPrefix);
             version->apply(rewriter);
             appendStmt(result, std::move(version));
         }
     }
+    return mk<ram::Sequence>(std::move(result));
+}
+
+Own<ram::Statement> UnitTranslator::generateIncrementalNonRecursive(const ast::Relation& rel) const {
+    VecOwn<ram::Statement> result;
+    appendStmt(result, generateDeltaRules(rel, "diff_plus_", /* includeRecursive */ false));
     // Publish the newly-derived tuples into the full relation.
     appendStmt(result, generateMergeRelations(
                                &rel, getConcreteRelationName(rel.getQualifiedName()), diffPlusName(&rel)));
+    return mk<ram::Sequence>(std::move(result));
+}
+
+Own<ram::Statement> UnitTranslator::generateIncrementalRecursive(
+        const ast::RelationSet& scc, std::size_t sccNumber) const {
+    VecOwn<ram::Statement> result;
+
+    // Seed each relation's @delta with the new tuples (delta rules using diff_plus of lower-stratum atoms;
+    // the version that ranges a same-SCC atom over its empty diff_plus is a harmless no-op), then merge the
+    // seed into the full relation.
+    for (const ast::Relation* rel : scc) {
+        appendStmt(result, generateDeltaRules(*rel, "@delta_", /* includeRecursive */ true));
+    }
+    for (const ast::Relation* rel : scc) {
+        appendStmt(result, generateMergeRelations(rel, getConcreteRelationName(rel->getQualifiedName()),
+                                   getDeltaRelationName(rel->getQualifiedName())));
+    }
+
+    // The standard semi-naive fixpoint (mirrors generateRecursiveStratum, minus the from-scratch preamble) —
+    // driven by the seeded @delta, so the work is proportional to the seed.
+    auto joinSizeSequence = mk<ram::Sequence>(context->getRecursiveJoinSizeStatementsInSCC(sccNumber));
+    const std::string loopCounter = "loop_counter";
+    VecOwn<ram::Expression> inc;
+    inc.push_back(mk<ram::Variable>(loopCounter));
+    inc.push_back(mk<ram::UnsignedConstant>(1));
+    auto incrementCounter = mk<ram::Assign>(mk<ram::Variable>(loopCounter),
+            mk<ram::IntrinsicOperator>(FunctorOp::UADD, std::move(inc)), false);
+    auto fixpointLoop = mk<ram::Loop>(mk<ram::Sequence>(generateStratumLoopBody(scc),
+            std::move(joinSizeSequence), generateStratumExitSequence(scc), generateStratumTableUpdates(scc),
+            std::move(incrementCounter)));
+    appendStmt(result, mk<ram::Assign>(mk<ram::Variable>(loopCounter), mk<ram::UnsignedConstant>(1), true));
+    appendStmt(result, std::move(fixpointLoop));
+    appendStmt(result, generateStratumPostamble(scc));
+
+    // Conservatively publish the relations into their diff_plus so downstream strata see the changes.
+    for (const ast::Relation* rel : scc) {
+        appendStmt(result, generateMergeRelations(
+                                   rel, diffPlusName(rel), getConcreteRelationName(rel->getQualifiedName())));
+    }
     return mk<ram::Sequence>(std::move(result));
 }
 
@@ -152,12 +208,10 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
         std::size_t scc = sccOrdering.at(i);
         const auto& sccRelations = context->getRelationsInSCC(scc);
         if (context->isRecursiveSCC(scc)) {
-            appendStmt(body, generateRecursiveStratum(sccRelations, scc));
             if (monotone) {
-                for (const ast::Relation* rel : sccRelations) {
-                    appendStmt(body, generateMergeRelations(rel, diffPlusName(rel),
-                                             getConcreteRelationName(rel->getQualifiedName())));
-                }
+                appendStmt(body, generateIncrementalRecursive(sccRelations, scc));
+            } else {
+                appendStmt(body, generateRecursiveStratum(sccRelations, scc));
             }
         } else if (!sccRelations.empty()) {
             const ast::Relation* rel = *sccRelations.begin();
