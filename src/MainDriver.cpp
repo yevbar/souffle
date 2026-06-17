@@ -20,6 +20,7 @@
 #include "ast/Node.h"
 #include "ast/Program.h"
 #include "ast/TranslationUnit.h"
+#include "ast/analysis/IncrementalRelations.h"
 #include "ast/analysis/PrecedenceGraph.h"
 #include "ast/analysis/SCCGraph.h"
 #include "ast/analysis/typesystem/Type.h"
@@ -743,6 +744,7 @@ std::vector<MainOption> getMainOptions() {
               "\tprecedence-graph-text\n"
               "\tscc-graph\n"
               "\tscc-graph-text\n"
+              "\tincremental-relations\n"
               "\ttransformed-ast\n"
               "\ttransformed-ram\n"
               "\ttype-analysis"},
@@ -1038,6 +1040,12 @@ int main(Global& glb, const char* souffle_executable) {
     // Output the scc graph in text format
     if (hasShowOpt("scc-graph-text")) {
         astTranslationUnit->getAnalysis<ast::analysis::SCCGraphAnalysis>().print(std::cout);
+        std::cout << std::endl;
+    }
+
+    // Output the incremental relation classification
+    if (hasShowOpt("incremental-relations")) {
+        astTranslationUnit->getAnalysis<ast::analysis::IncrementalRelationsAnalysis>().print(std::cout);
         std::cout << std::endl;
     }
 

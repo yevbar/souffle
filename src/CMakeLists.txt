@@ -64,6 +64,7 @@ set(SOUFFLE_SOURCES
     ast/analysis/Functor.cpp
     ast/analysis/Ground.cpp
     ast/analysis/IOType.cpp
+    ast/analysis/IncrementalRelations.cpp
     ast/analysis/PrecedenceGraph.cpp
     ast/analysis/ProfileUse.cpp
     ast/analysis/RecursiveClauses.cpp
