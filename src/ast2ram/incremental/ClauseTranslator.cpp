@@ -17,6 +17,7 @@
 #include "ast2ram/incremental/ClauseTranslator.h"
 #include "ast/Atom.h"
 #include "ast/Clause.h"
+#include "ast/Variable.h"
 #include "ast2ram/utility/TranslatorContext.h"
 #include "ast2ram/utility/Utils.h"
 #include "ast2ram/utility/ValueIndex.h"
@@ -26,6 +27,7 @@
 #include "ram/Filter.h"
 #include "ram/GuardedInsert.h"
 #include "ram/Insert.h"
+#include "ram/IntrinsicOperator.h"
 #include "ram/Negation.h"
 #include "ram/Operation.h"
 #include "ram/SignedConstant.h"
@@ -35,6 +37,39 @@
 #include <string>
 
 namespace souffle::ast2ram::incremental {
+
+void ClauseTranslator::indexAtoms(const ast::Clause& clause) {
+    std::size_t atomIdx = 0;
+    for (const auto* atom : getAtomOrdering(clause)) {
+        std::size_t scanLevel = addOperatorLevel(atom);
+        indexNodeArguments(scanLevel, atom->getArguments());
+
+        // Bind this atom's two auxiliary columns so they can be threaded.
+        valueIndex->addVarReference("@count_" + std::to_string(atomIdx), scanLevel, atom->getArity());
+        valueIndex->addVarReference("@iteration_" + std::to_string(atomIdx), scanLevel, atom->getArity() + 1);
+
+        atomIdx++;
+    }
+}
+
+Own<ram::Expression> ClauseTranslator::getIterationNumber(const ast::Clause& clause) const {
+    const auto& bodyAtoms = getAtomOrdering(clause);
+    if (bodyAtoms.empty()) return mk<ram::SignedConstant>(0);
+
+    VecOwn<ram::Expression> depths;
+    for (std::size_t i = 0; i < bodyAtoms.size(); i++) {
+        auto iterVar = mk<ast::Variable>("@iteration_" + std::to_string(i));
+        depths.push_back(context.translateValue(*valueIndex, iterVar.get()));
+    }
+
+    auto maxDepth = depths.size() == 1 ? std::move(depths.at(0))
+                                       : mk<ram::IntrinsicOperator>(FunctorOp::MAX, std::move(depths));
+
+    VecOwn<ram::Expression> addArgs;
+    addArgs.push_back(std::move(maxDepth));
+    addArgs.push_back(mk<ram::SignedConstant>(1));
+    return mk<ram::IntrinsicOperator>(FunctorOp::ADD, std::move(addArgs));
+}
 
 namespace {
 // A data-tuple membership test against a relation carrying the two auxiliary
@@ -83,11 +118,12 @@ Own<ram::Operation> ClauseTranslator::createInsertion(const ast::Clause& clause)
         values.push_back(context.translateValue(*valueIndex, arg));
     }
 
-    // @count / @iteration auxiliary columns. Placeholder values for now — the
-    // counting evaluation that derives a tuple's true derivation count and
-    // first iteration is layered on top of this scaffold.
-    values.push_back(mk<ram::SignedConstant>(1));  // @count
-    values.push_back(mk<ram::SignedConstant>(0));  // @iteration
+    // @count is a placeholder (1) until multiset accounting lands. @iteration
+    // is the derivation depth: one more than the deepest body atom (0 for a
+    // fact). Set semantics keeps the first derivation, so this records the
+    // depth at which the tuple first appears.
+    values.push_back(mk<ram::SignedConstant>(1));        // @count
+    values.push_back(getIterationNumber(clause));        // @iteration
 
     // Propositions
     if (head->getArity() == 0) {

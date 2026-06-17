@@ -17,10 +17,12 @@
  * membership with the auxiliary columns left free. Everything else is
  * inherited from the semi-naive translator unchanged.
  *
- * The appended values are placeholders for now — @count = 1, @iteration = 0
- * — chosen so the auxiliary columns are well-formed without yet changing
- * what the program computes. The counting evaluation that gives them their
- * real meaning is layered on top of this scaffold.
+ * @iteration carries the derivation depth: one more than the greatest
+ * @iteration among the body atoms (a fact has depth 0). Set semantics keeps
+ * the first derivation of a tuple, so the stored depth is the depth at which
+ * the tuple first appears — the sparsification the incremental state needs.
+ * @count is still a placeholder (1); a true derivation count needs multiset
+ * accounting that is added separately.
  *
  * A negated body atom must supply a value for every column (the data values
  * plus a free value per auxiliary column); an existence check given only the
@@ -59,6 +61,11 @@ protected:
     Own<ram::Operation> addNegatedAtom(
             Own<ram::Operation> op, const ast::Clause& clause, const ast::Atom* atom) const override;
     Own<ram::Operation> createInsertion(const ast::Clause& clause) const override;
+    void indexAtoms(const ast::Clause& clause) override;
+
+private:
+    /** @iteration threaded into the head tuple: max body-atom depth, plus one. */
+    Own<ram::Expression> getIterationNumber(const ast::Clause& clause) const;
 };
 
 }  // namespace souffle::ast2ram::incremental
