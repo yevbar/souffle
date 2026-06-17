@@ -33,10 +33,12 @@
 
 namespace souffle::ast {
 class Relation;
-}
+class TranslationUnit;
+}  // namespace souffle::ast
 
 namespace souffle::ram {
 class Relation;
+class Sequence;
 class Statement;
 }  // namespace souffle::ram
 
@@ -47,6 +49,9 @@ public:
     UnitTranslator() : ast2ram::seminaive::UnitTranslator() {}
 
 protected:
+    /** Generate the normal program, then register the incremental `update` subroutine. */
+    Own<ram::Sequence> generateProgram(const ast::TranslationUnit& translationUnit) override;
+
     /** Grow every relation by the @count / @iteration auxiliary columns. */
     Own<ram::Relation> createRamRelation(const ast::Relation* baseRelation, std::string ramRelationName,
             RelationRepresentation) const override;
