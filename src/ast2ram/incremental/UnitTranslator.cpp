@@ -22,7 +22,6 @@
 #include "ast/analysis/TopologicallySortedSCCGraph.h"
 #include "ast2ram/utility/TranslatorContext.h"
 #include "ast2ram/utility/Utils.h"
-#include "ram/Clear.h"
 #include "ram/Insert.h"
 #include "ram/MergeExtend.h"
 #include "ram/Query.h"
@@ -72,8 +71,9 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
     // clearing is needed (and in-subroutine ram::Clear is unreliable anyway — the synthesiser gates the purge
     // of a non-temporary relation on `pruneImdtRels`, which is not set during executeSubroutine). The driver
     // owns the staging relations' lifecycle and purges them after the call. Deletion (which does need tuples
-    // removed) is a later step; the seeded fixpoint that makes this genuinely incremental replaces the
-    // re-run next.
+    // removed) is a later step; the per-stratum delta evaluation that makes this genuinely incremental
+    // replaces the re-run next (see PHASE3_UPDATE_PLAN.md — it needs the diff_plus relations to be visible to
+    // the translation's analyses, which the AST-rewrite prototype was not).
     const auto& sccOrdering =
             translationUnit.getAnalysis<ast::analysis::TopologicallySortedSCCGraphAnalysis>().order();
     const ast::Program* program = context->getProgram();
