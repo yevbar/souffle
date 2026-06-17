@@ -52,6 +52,9 @@ protected:
     /** Generate the normal program, then register the incremental `update` subroutine. */
     Own<ram::Sequence> generateProgram(const ast::TranslationUnit& translationUnit) override;
 
+    /** Create the normal relations plus a `diff_plus_<R>` staging relation per relation. */
+    VecOwn<ram::Relation> createRamRelations(const std::vector<std::size_t>& sccOrdering) const override;
+
     /** Grow every relation by the @count / @iteration auxiliary columns. */
     Own<ram::Relation> createRamRelation(const ast::Relation* baseRelation, std::string ramRelationName,
             RelationRepresentation) const override;
