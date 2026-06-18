@@ -128,17 +128,16 @@ struct RederiveRestrictor : public ram::NodeMapper {
     Own<ram::Node> operator()(Own<ram::Node> node) const override {
         if (const auto* insert = as<ram::Insert>(node.get())) {
             const auto& iv = insert->getValues();
-            // iv = [data..., @count, @iteration]; the last two are auxiliary.
+            // iv = [data..., @iteration]; the last column is the single auxiliary one.
             Own<ram::Condition> cond;
-            if (iv.size() <= 2) {
+            if (iv.size() <= 1) {
                 // nullary head: re-derive only if the candidate flag (diff_minus) is non-empty.
                 cond = mk<ram::Negation>(mk<ram::EmptinessCheck>(diffMinus));
             } else {
                 VecOwn<ram::Expression> values;
-                for (std::size_t i = 0; i + 2 < iv.size(); i++) {
+                for (std::size_t i = 0; i + 1 < iv.size(); i++) {
                     values.push_back(clone(iv[i]));
                 }
-                values.push_back(mk<ram::UndefValue>());  // @count: free
                 values.push_back(mk<ram::UndefValue>());  // @iteration: free
                 cond = mk<ram::ExistenceCheck>(diffMinus, std::move(values));
             }
@@ -284,7 +283,7 @@ Own<ram::Statement> UnitTranslator::generateDeltaRules(const ast::Relation& rel,
 Own<ram::Statement> UnitTranslator::generateEraseAll(
         const ast::Relation* rel, const std::string& destRelation, const std::string& srcRelation) const {
     VecOwn<ram::Expression> values;
-    for (std::size_t i = 0; i < rel->getArity() + 2; i++) {
+    for (std::size_t i = 0; i < rel->getArity() + 1; i++) {
         values.push_back(mk<ram::TupleElement>(0, i));
     }
     return mk<ram::Query>(mk<ram::Scan>(srcRelation, 0, mk<ram::Erase>(destRelation, std::move(values))));
@@ -687,10 +686,9 @@ Own<ram::Relation> UnitTranslator::createRamRelation(const ast::Relation* baseRe
     std::vector<std::string> attributeNames = relation->getAttributeNames();
     std::vector<std::string> attributeTypeQualifiers = relation->getAttributeTypes();
 
-    // Sparse-state columns for incremental evaluation.
-    attributeNames.push_back("@count");
-    attributeTypeQualifiers.push_back("i:number");
-
+    // One sparse-state column for incremental evaluation: @iteration (the derivation depth driving the
+    // recursive semi-naive fixpoint). (@count was a reserved placeholder always equal to 1 and never read —
+    // the deletion path uses re-discovery, not counts — so it was removed: a dead column on every tuple.)
     attributeNames.push_back("@iteration");
     attributeTypeQualifiers.push_back("i:number");
 
@@ -705,21 +703,21 @@ Own<ram::Relation> UnitTranslator::createRamRelation(const ast::Relation* baseRe
         representation = RelationRepresentation::BTREE_DELETE;
     }
 
-    return mk<ram::Relation>(ramRelationName, arity + 2, auxiliaryArity + 2, attributeNames,
+    return mk<ram::Relation>(ramRelationName, arity + 1, auxiliaryArity + 1, attributeNames,
             attributeTypeQualifiers, representation);
 }
 
 void UnitTranslator::addAuxiliaryArity(
         const ast::Relation* /* relation */, std::map<std::string, std::string>& directives) const {
-    directives.insert(std::make_pair("auxArity", "2"));
+    directives.insert(std::make_pair("auxArity", "1"));
 }
 
 Own<ram::Statement> UnitTranslator::generateMergeRelations(
         const ast::Relation* rel, const std::string& destRelation, const std::string& srcRelation) const {
     VecOwn<ram::Expression> values;
 
-    // Copy every column, including the two auxiliary columns.
-    for (std::size_t i = 0; i < rel->getArity() + 2; i++) {
+    // Copy every column, including the single auxiliary column (@iteration).
+    for (std::size_t i = 0; i < rel->getArity() + 1; i++) {
         values.push_back(mk<ram::TupleElement>(0, i));
     }
 

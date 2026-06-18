@@ -44,9 +44,8 @@ void ClauseTranslator::indexAtoms(const ast::Clause& clause) {
         std::size_t scanLevel = addOperatorLevel(atom);
         indexNodeArguments(scanLevel, atom->getArguments());
 
-        // Bind this atom's two auxiliary columns so they can be threaded.
-        valueIndex->addVarReference("@count_" + std::to_string(atomIdx), scanLevel, atom->getArity());
-        valueIndex->addVarReference("@iteration_" + std::to_string(atomIdx), scanLevel, atom->getArity() + 1);
+        // Bind this atom's single auxiliary column (@iteration, at the position just past the data columns).
+        valueIndex->addVarReference("@iteration_" + std::to_string(atomIdx), scanLevel, atom->getArity());
 
         atomIdx++;
     }
@@ -96,7 +95,6 @@ Own<ram::Operation> negatedMembership(Own<ram::Operation> op, std::string relNam
     for (const auto* arg : atom->getArguments()) {
         values.push_back(context.translateValue(valueIndex, arg));
     }
-    values.push_back(mk<ram::UndefValue>());  // @count: free
     values.push_back(mk<ram::UndefValue>());  // @iteration: free
 
     return mk<ram::Filter>(
@@ -125,14 +123,12 @@ Own<ram::Operation> ClauseTranslator::createInsertion(const ast::Clause& clause)
         values.push_back(context.translateValue(*valueIndex, arg));
     }
 
-    // @count is a placeholder (1) until multiset accounting lands. @iteration is the derivation depth: one
-    // more than the deepest body atom (0 for a fact). Set semantics keeps the first derivation, so this
-    // records the depth at which the tuple first appears.
+    // @iteration is the derivation depth: one more than the deepest body atom (0 for a fact). Set semantics
+    // keeps the first derivation, so this records the depth at which the tuple first appears.
     //
     // A nullary (proposition) head uses a CONSTANT iteration: souffle hoists the insert of a nullary relation
     // out of the body scan (it is loop-invariant once derived), so a body-dependent value would reference an
     // out-of-scope tuple. @iteration is internal, stripped state, so the exact depth here does not matter.
-    values.push_back(mk<ram::SignedConstant>(1));  // @count
     values.push_back(head->getArity() == 0 ? mk<ram::Expression, ram::SignedConstant>(0)
                                            : getIterationNumber(clause));  // @iteration
 

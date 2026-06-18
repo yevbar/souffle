@@ -41,8 +41,7 @@ Own<ram::Condition> ConstraintTranslator::visit_(type_identity<ast::Negation>, c
         values.push_back(context.translateValue(index, arg));
     }
 
-    // @count / @iteration auxiliary columns, left free for the membership test.
-    values.push_back(mk<ram::UndefValue>());
+    // @iteration auxiliary column, left free for the membership test.
     values.push_back(mk<ram::UndefValue>());
 
     return mk<ram::Negation>(

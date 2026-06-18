@@ -116,17 +116,18 @@ namespace souffle::interpreter {
     func(BtreeDelete, 20, 0, __VA_ARGS__) \
     func(BtreeDelete, 21, 0, __VA_ARGS__) \
     func(BtreeDelete, 22, 0, __VA_ARGS__) \
-    /* auxiliary-arity 2 variants: the incremental strategy adds @count/@iteration auxiliary columns and
-       erases tuples for DRed deletion, so the interpreter needs the deletion-capable structure at those
-       (arity, auxArity=2) shapes — mirrors the auxiliary-2 entries in FOR_EACH_BTREE. */ \
-    func(BtreeDelete, 2, 2, __VA_ARGS__) \
-    func(BtreeDelete, 3, 2, __VA_ARGS__) \
-    func(BtreeDelete, 4, 2, __VA_ARGS__) \
-    func(BtreeDelete, 5, 2, __VA_ARGS__) \
-    func(BtreeDelete, 6, 2, __VA_ARGS__) \
-    func(BtreeDelete, 7, 2, __VA_ARGS__) \
-    func(BtreeDelete, 8, 2, __VA_ARGS__) \
-    func(BtreeDelete, 9, 2, __VA_ARGS__)
+    /* auxiliary-arity 1 variants: the incremental strategy adds one @iteration auxiliary column and erases
+       tuples for DRed deletion, so the interpreter needs the deletion-capable structure at those
+       (arity, auxArity=1) shapes — mirrors the auxiliary-1 entries in FOR_EACH_BTREE. */ \
+    func(BtreeDelete, 1, 1, __VA_ARGS__) \
+    func(BtreeDelete, 2, 1, __VA_ARGS__) \
+    func(BtreeDelete, 3, 1, __VA_ARGS__) \
+    func(BtreeDelete, 4, 1, __VA_ARGS__) \
+    func(BtreeDelete, 5, 1, __VA_ARGS__) \
+    func(BtreeDelete, 6, 1, __VA_ARGS__) \
+    func(BtreeDelete, 7, 1, __VA_ARGS__) \
+    func(BtreeDelete, 8, 1, __VA_ARGS__) \
+    func(BtreeDelete, 9, 1, __VA_ARGS__)
 
 // Brie is disabled for now.
 #define FOR_EACH_BRIE(func, ...)
