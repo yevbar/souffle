@@ -85,6 +85,12 @@ private:
     /** The relation names a stratum reads in its clause bodies (positive and negated), excluding its own SCC. */
     std::set<std::string> stratumDependencies(const ast::RelationSet& scc) const;
 
+    /** The signal relations whose non-emptiness means the stratum must run (dep __dirty flags + own input diff). */
+    std::set<std::string> stratumSignals(const ast::RelationSet& scc) const;
+
+    /** Set the nullary `__dirty_<R>` "ran" flag for each relation in the stratum (the cheap dirty signal). */
+    Own<ram::Statement> generateSetDirty(const ast::RelationSet& scc) const;
+
     /**
      * Incremental delta evaluation of a non-recursive relation: the delta rules into `diff_plus_<R>`, then
      * merge into <R>. Only sound for monotone programs.

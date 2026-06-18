@@ -27,6 +27,7 @@
 #include "ast2ram/utility/TranslatorContext.h"
 #include "ast2ram/utility/Utils.h"
 #include "ram/Assign.h"
+#include "ram/Clear.h"
 #include "ram/Condition.h"
 #include "ram/Conjunction.h"
 #include "ram/EmptinessCheck.h"
@@ -63,6 +64,12 @@ std::string diffPlusName(const ast::Relation* rel) {
 }
 std::string diffMinusName(const ast::Relation* rel) {
     return getConcreteRelationName(rel->getQualifiedName(), "diff_minus_");
+}
+// A nullary "this stratum ran" flag — the cheap dirty signal the guard reads downstream (replaces copying the
+// whole relation into diff_plus/diff_minus just to signal a change). The driver purges it between updates,
+// like the diff relations (an @-prefix would make it a temporary that a RAM transform removes as unused).
+std::string dirtyName(const ast::Relation* rel) {
+    return getConcreteRelationName(rel->getQualifiedName(), "__dirty_");
 }
 
 // Rewrites one clause's RAM into a delta version: ranges the `target`-th scan (pre-order) over its
@@ -143,11 +150,6 @@ std::set<std::string> UnitTranslator::stratumDependencies(const ast::RelationSet
     }
     std::set<std::string> deps;
     for (const ast::Relation* rel : scc) {
-        // A relation read from input is its own dependency: its staged input diff can change it even when
-        // none of the relations it reads changed, so the guard must check its own diff_plus/diff_minus too.
-        if (!context->getLoadDirectives(rel->getQualifiedName()).empty()) {
-            deps.insert(getConcreteRelationName(rel->getQualifiedName()));
-        }
         for (const auto* clause : context->getProgram()->getClauses(*rel)) {
             visit(*clause, [&](const ast::Atom& atom) {
                 std::string name = getConcreteRelationName(atom.getQualifiedName());
@@ -161,19 +163,34 @@ std::set<std::string> UnitTranslator::stratumDependencies(const ast::RelationSet
 }
 
 Own<ram::Statement> UnitTranslator::guardStratum(
-        Own<ram::Statement> body, const std::set<std::string>& dependencies) const {
-    // clean = every dependency's diff_plus AND diff_minus is empty.
+        Own<ram::Statement> body, const std::set<std::string>& signalRelations) const {
+    // clean = every signal relation is empty (a dependency's __dirty flag, or an input relation's own staged
+    // diff). LOOP { EXIT(clean); <body>; EXIT(true); } runs the body once iff some signal is non-empty.
     Own<ram::Condition> clean = mk<ram::True>();
-    for (const auto& dep : dependencies) {
-        clean = mk<ram::Conjunction>(std::move(clean), mk<ram::EmptinessCheck>("diff_plus_" + dep));
-        clean = mk<ram::Conjunction>(std::move(clean), mk<ram::EmptinessCheck>("diff_minus_" + dep));
+    for (const auto& name : signalRelations) {
+        clean = mk<ram::Conjunction>(std::move(clean), mk<ram::EmptinessCheck>(name));
     }
-    // LOOP { EXIT(clean); <body>; EXIT(true); } runs the body once iff some dependency changed.
     VecOwn<ram::Statement> loopBody;
     appendStmt(loopBody, mk<ram::Exit>(std::move(clean)));
     appendStmt(loopBody, std::move(body));
     appendStmt(loopBody, mk<ram::Exit>(mk<ram::True>()));
     return mk<ram::Loop>(mk<ram::Sequence>(std::move(loopBody)));
+}
+
+// The signal relations whose non-emptiness means a stratum must run: each dependency's __dirty flag, plus —
+// for an input relation in the stratum — its own staged diff (an input change is independent of what it reads).
+std::set<std::string> UnitTranslator::stratumSignals(const ast::RelationSet& scc) const {
+    std::set<std::string> signals;
+    for (const auto& dep : stratumDependencies(scc)) {
+        signals.insert("__dirty_" + dep);
+    }
+    for (const ast::Relation* rel : scc) {
+        if (!context->getLoadDirectives(rel->getQualifiedName()).empty()) {
+            signals.insert(diffPlusName(rel));
+            signals.insert(diffMinusName(rel));
+        }
+    }
+    return signals;
 }
 
 Own<ram::Statement> UnitTranslator::generateIncrementalNonRecursive(const ast::Relation& rel) const {
@@ -200,6 +217,14 @@ Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relatio
     return mk<ram::Sequence>(std::move(result));
 }
 
+Own<ram::Statement> UnitTranslator::generateSetDirty(const ast::RelationSet& scc) const {
+    VecOwn<ram::Statement> result;
+    for (const ast::Relation* rel : scc) {
+        appendStmt(result, mk<ram::Query>(mk<ram::Insert>(dirtyName(rel), VecOwn<ram::Expression>{})));
+    }
+    return mk<ram::Sequence>(std::move(result));
+}
+
 Own<ram::Statement> UnitTranslator::generateStratumRecompute(
         const ast::RelationSet& scc, std::size_t sccNumber, bool publish) const {
     // Recompute a stratum, correct for insertions, deletions AND negation sign-flips (which add and remove
@@ -214,7 +239,10 @@ Own<ram::Statement> UnitTranslator::generateStratumRecompute(
     VecOwn<ram::Statement> result;
     const bool recursive = context->isRecursiveSCC(sccNumber);
 
-    // Empty each relation (publishing the old contents as deletions first when requested).
+    // Empty each relation: copy it to the diff_minus scratch, then erase those tuples. (A cheaper Swap-based
+    // clear does NOT work here: std::swap exchanges the relation objects but the RelationWrapper that backs
+    // getRelation does not follow, so the driver would then read the wrong object. Swap is only safe for the
+    // unexposed @delta/@new temporaries.)
     for (const ast::Relation* rel : scc) {
         const std::string mainName = getConcreteRelationName(rel->getQualifiedName());
         appendStmt(result, generateMergeRelations(rel, diffMinusName(rel), mainName));
@@ -223,8 +251,7 @@ Own<ram::Statement> UnitTranslator::generateStratumRecompute(
 
     // A relation that is BOTH read from input AND has rules holds (input facts ∪ derived facts). Emptying it
     // above dropped its input facts too, so re-apply the staged input from diff_plus before re-deriving. (The
-    // driver stages the full input for such relations.) This runs before the merge-to-diff_minus reuse of the
-    // erase scratch is overwritten — the scratch already holds the old contents.
+    // driver stages the full input for such relations.)
     for (const ast::Relation* rel : scc) {
         if (!context->getLoadDirectives(rel->getQualifiedName()).empty()) {
             appendStmt(result, generateMergeRelations(
@@ -232,12 +259,16 @@ Own<ram::Statement> UnitTranslator::generateStratumRecompute(
         }
     }
 
-    // Re-run the standard from-scratch evaluation over the (already patched) dependencies.
+    // Re-run the standard from-scratch evaluation over the (already-patched) dependencies.
     if (recursive) {
         appendStmt(result, generateRecursiveStratum(scc, sccNumber));
     } else {
         appendStmt(result, generateNonRecursiveRelation(**scc.begin()));
     }
+
+    // Signal that this stratum ran, so downstream guards fire (the cheap dirty signal — replaces copying the
+    // whole relation to diff just to mark a change).
+    appendStmt(result, generateSetDirty(scc));
 
     // When publishing, expose the new contents as insertions for downstream incremental strata. (The old
     // contents already sit in diff_minus from the erase scratch above.) Without publishing, the diff_minus
@@ -262,6 +293,9 @@ VecOwn<ram::Relation> UnitTranslator::createRamRelations(const std::vector<std::
         for (const ast::Relation* rel : context->getRelationsInSCC(scc)) {
             ramRelations.push_back(createRamRelation(rel, diffPlusName(rel), RelationRepresentation::DEFAULT));
             ramRelations.push_back(createRamRelation(rel, diffMinusName(rel), RelationRepresentation::DEFAULT));
+            // __dirty_<R>: a nullary "ran" flag (no auxiliary columns) — the cheap dirty signal.
+            ramRelations.push_back(mk<ram::Relation>(dirtyName(rel), 0, 0, std::vector<std::string>{},
+                    std::vector<std::string>{}, RelationRepresentation::DEFAULT));
         }
     }
     return ramRelations;
@@ -304,35 +338,37 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
         std::size_t scc = sccOrdering.at(i);
         const auto& sccRelations = context->getRelationsInSCC(scc);
         if (context->isRecursiveSCC(scc)) {
-            // Recursive strata recompute (a diff-seeded fixpoint can't retract). Always publish: the diff is
-            // the dirty signal selective-stratum evaluation reads downstream (and feeds a downstream
-            // monotone delta stratum).
-            appendStmt(body, guardStratum(generateStratumRecompute(sccRelations, scc, /* publish */ true),
-                                     stratumDependencies(sccRelations)));
+            // Recursive strata recompute (a diff-seeded fixpoint can't retract). Publish for a downstream
+            // monotone delta stratum only when the program is monotone; the cheap __dirty flag (set inside
+            // generateStratumRecompute) carries the selective-stratum signal either way.
+            appendStmt(body, guardStratum(generateStratumRecompute(sccRelations, scc, /* publish */ monotone),
+                                     stratumSignals(sccRelations)));
         } else if (!sccRelations.empty()) {
             const ast::Relation* rel = *sccRelations.begin();
             if (program->getClauses(*rel).empty()) {
-                // Extensional: erase the staged deletions, then merge the staged insertions. Guarded on its
-                // own staged diff (it has no dependencies).
+                // Extensional: erase the staged deletions, merge the staged insertions, signal it ran.
+                // Guarded on its own staged diff (it has no dependencies).
                 VecOwn<ram::Statement> edb;
                 appendStmt(edb, generateEraseAll(rel, getConcreteRelationName(rel->getQualifiedName()),
                                        diffMinusName(rel)));
                 appendStmt(edb, generateMergeRelations(rel,
                                        getConcreteRelationName(rel->getQualifiedName()), diffPlusName(rel)));
+                appendStmt(edb, generateSetDirty(sccRelations));
                 appendStmt(body, guardStratum(mk<ram::Sequence>(std::move(edb)),
-                                         {getConcreteRelationName(rel->getQualifiedName())}));
+                                         {diffPlusName(rel), diffMinusName(rel)}));
             } else if (monotone) {
-                // Monotone intensional: deletion (DRed) then insertion (delta).
+                // Monotone intensional: deletion (DRed) then insertion (delta); the delta itself populates
+                // diff_plus/diff_minus, and __dirty signals downstream.
                 VecOwn<ram::Statement> idb;
                 appendStmt(idb, generateIncrementalDelete(*rel));
                 appendStmt(idb, generateIncrementalNonRecursive(*rel));
+                appendStmt(idb, generateSetDirty(sccRelations));
                 appendStmt(body, guardStratum(mk<ram::Sequence>(std::move(idb)),
-                                         stratumDependencies(sccRelations)));
+                                         stratumSignals(sccRelations)));
             } else {
-                // Non-monotone (negation): recompute the stratum so sign-flips are retracted correctly.
-                // Always publish: the diff is the dirty signal for selective-stratum evaluation downstream.
-                appendStmt(body, guardStratum(generateStratumRecompute(sccRelations, scc, /* publish */ true),
-                                         stratumDependencies(sccRelations)));
+                // Non-monotone (negation): recompute so sign-flips are retracted correctly (sets __dirty).
+                appendStmt(body, guardStratum(generateStratumRecompute(sccRelations, scc, /* publish */ false),
+                                         stratumSignals(sccRelations)));
             }
         }
     }
