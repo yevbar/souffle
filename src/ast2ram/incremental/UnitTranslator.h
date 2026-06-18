@@ -74,6 +74,18 @@ private:
             const ast::Relation* rel, const std::string& destRelation, const std::string& srcRelation) const;
 
     /**
+     * Wrap a stratum's update in a guard that skips it when none of `dependencies` changed (all their
+     * diff_plus / diff_minus are empty) — selective-stratum evaluation. A stratum that runs populates its
+     * own diff (the erase scratch / publish), which makes downstream guards fire; a skipped stratum leaves
+     * its diff empty, so strata that are not downstream of a change are skipped entirely.
+     */
+    Own<ram::Statement> guardStratum(
+            Own<ram::Statement> body, const std::set<std::string>& dependencies) const;
+
+    /** The relation names a stratum reads in its clause bodies (positive and negated), excluding its own SCC. */
+    std::set<std::string> stratumDependencies(const ast::RelationSet& scc) const;
+
+    /**
      * Incremental delta evaluation of a non-recursive relation: the delta rules into `diff_plus_<R>`, then
      * merge into <R>. Only sound for monotone programs.
      */

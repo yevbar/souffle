@@ -26,7 +26,11 @@
 #include "ast2ram/utility/TranslatorContext.h"
 #include "ast2ram/utility/Utils.h"
 #include "ram/Assign.h"
+#include "ram/Condition.h"
+#include "ram/Conjunction.h"
+#include "ram/EmptinessCheck.h"
 #include "ram/Erase.h"
+#include "ram/Exit.h"
 #include "ram/Insert.h"
 #include "ram/IntrinsicOperator.h"
 #include "ram/Loop.h"
@@ -37,6 +41,7 @@
 #include "ram/Scan.h"
 #include "ram/Sequence.h"
 #include "ram/Statement.h"
+#include "ram/True.h"
 #include "ram/TupleElement.h"
 #include "ram/UnsignedConstant.h"
 #include "ram/Variable.h"
@@ -44,6 +49,7 @@
 #include "souffle/utility/ContainerUtil.h"
 #include "souffle/utility/MiscUtil.h"
 #include <cstddef>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -127,6 +133,41 @@ Own<ram::Statement> UnitTranslator::generateEraseAll(
         values.push_back(mk<ram::TupleElement>(0, i));
     }
     return mk<ram::Query>(mk<ram::Scan>(srcRelation, 0, mk<ram::Erase>(destRelation, std::move(values))));
+}
+
+std::set<std::string> UnitTranslator::stratumDependencies(const ast::RelationSet& scc) const {
+    std::set<std::string> sccNames;
+    for (const ast::Relation* rel : scc) {
+        sccNames.insert(getConcreteRelationName(rel->getQualifiedName()));
+    }
+    std::set<std::string> deps;
+    for (const ast::Relation* rel : scc) {
+        for (const auto* clause : context->getProgram()->getClauses(*rel)) {
+            visit(*clause, [&](const ast::Atom& atom) {
+                std::string name = getConcreteRelationName(atom.getQualifiedName());
+                if (sccNames.find(name) == sccNames.end()) {
+                    deps.insert(name);
+                }
+            });
+        }
+    }
+    return deps;
+}
+
+Own<ram::Statement> UnitTranslator::guardStratum(
+        Own<ram::Statement> body, const std::set<std::string>& dependencies) const {
+    // clean = every dependency's diff_plus AND diff_minus is empty.
+    Own<ram::Condition> clean = mk<ram::True>();
+    for (const auto& dep : dependencies) {
+        clean = mk<ram::Conjunction>(std::move(clean), mk<ram::EmptinessCheck>("diff_plus_" + dep));
+        clean = mk<ram::Conjunction>(std::move(clean), mk<ram::EmptinessCheck>("diff_minus_" + dep));
+    }
+    // LOOP { EXIT(clean); <body>; EXIT(true); } runs the body once iff some dependency changed.
+    VecOwn<ram::Statement> loopBody;
+    appendStmt(loopBody, mk<ram::Exit>(std::move(clean)));
+    appendStmt(loopBody, std::move(body));
+    appendStmt(loopBody, mk<ram::Exit>(mk<ram::True>()));
+    return mk<ram::Loop>(mk<ram::Sequence>(std::move(loopBody)));
 }
 
 Own<ram::Statement> UnitTranslator::generateIncrementalNonRecursive(const ast::Relation& rel) const {
@@ -242,24 +283,35 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
         std::size_t scc = sccOrdering.at(i);
         const auto& sccRelations = context->getRelationsInSCC(scc);
         if (context->isRecursiveSCC(scc)) {
-            // Recursive strata recompute (a diff-seeded fixpoint can't retract); publish for downstream
-            // incremental strata only when the whole program is monotone.
-            appendStmt(body, generateStratumRecompute(sccRelations, scc, /* publish */ monotone));
+            // Recursive strata recompute (a diff-seeded fixpoint can't retract). Always publish: the diff is
+            // the dirty signal selective-stratum evaluation reads downstream (and feeds a downstream
+            // monotone delta stratum).
+            appendStmt(body, guardStratum(generateStratumRecompute(sccRelations, scc, /* publish */ true),
+                                     stratumDependencies(sccRelations)));
         } else if (!sccRelations.empty()) {
             const ast::Relation* rel = *sccRelations.begin();
             if (program->getClauses(*rel).empty()) {
-                // Extensional: erase the staged deletions, then merge the staged insertions.
-                appendStmt(body, generateEraseAll(rel, getConcreteRelationName(rel->getQualifiedName()),
-                                         diffMinusName(rel)));
-                appendStmt(body, generateMergeRelations(rel,
-                                         getConcreteRelationName(rel->getQualifiedName()), diffPlusName(rel)));
+                // Extensional: erase the staged deletions, then merge the staged insertions. Guarded on its
+                // own staged diff (it has no dependencies).
+                VecOwn<ram::Statement> edb;
+                appendStmt(edb, generateEraseAll(rel, getConcreteRelationName(rel->getQualifiedName()),
+                                       diffMinusName(rel)));
+                appendStmt(edb, generateMergeRelations(rel,
+                                       getConcreteRelationName(rel->getQualifiedName()), diffPlusName(rel)));
+                appendStmt(body, guardStratum(mk<ram::Sequence>(std::move(edb)),
+                                         {getConcreteRelationName(rel->getQualifiedName())}));
             } else if (monotone) {
                 // Monotone intensional: deletion (DRed) then insertion (delta).
-                appendStmt(body, generateIncrementalDelete(*rel));
-                appendStmt(body, generateIncrementalNonRecursive(*rel));
+                VecOwn<ram::Statement> idb;
+                appendStmt(idb, generateIncrementalDelete(*rel));
+                appendStmt(idb, generateIncrementalNonRecursive(*rel));
+                appendStmt(body, guardStratum(mk<ram::Sequence>(std::move(idb)),
+                                         stratumDependencies(sccRelations)));
             } else {
                 // Non-monotone (negation): recompute the stratum so sign-flips are retracted correctly.
-                appendStmt(body, generateStratumRecompute(sccRelations, scc, /* publish */ false));
+                // Always publish: the diff is the dirty signal for selective-stratum evaluation downstream.
+                appendStmt(body, guardStratum(generateStratumRecompute(sccRelations, scc, /* publish */ true),
+                                         stratumDependencies(sccRelations)));
             }
         }
     }
