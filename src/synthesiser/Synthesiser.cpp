@@ -598,12 +598,21 @@ void Synthesiser::emitCode(std::ostream& out, const Statement& stmt) {
 
         void visit_(type_identity<Swap>, const Swap& swap, std::ostream& out) override {
             PRINT_BEGIN_COMMENT(out);
-            const std::string& deltaKnowledge =
-                    synthesiser.getRelationName(synthesiser.lookup(swap.getFirstRelation()));
-            const std::string& newKnowledge =
-                    synthesiser.getRelationName(synthesiser.lookup(swap.getSecondRelation()));
+            const auto* relA = synthesiser.lookup(swap.getFirstRelation());
+            const auto* relB = synthesiser.lookup(swap.getSecondRelation());
+            const std::string& nameA = synthesiser.getRelationName(relA);
+            const std::string& nameB = synthesiser.getRelationName(relB);
 
-            out << "std::swap(" << deltaKnowledge << ", " << newKnowledge << ");\n";
+            // Relations are held as Own<> and exposed to the driver through a RelationWrapper that binds a
+            // reference to the relation OBJECT. Swapping the Own<> pointers would leave the wrappers pointing
+            // at the wrong objects, so when either relation is exposed (non-temporary) swap the object
+            // CONTENTS instead (an O(1) btree swap). Temporaries have no wrapper, so the cheaper pointer swap
+            // is kept for the semi-naive @delta/@new exchange.
+            if (relA->isTemp() && relB->isTemp()) {
+                out << "std::swap(" << nameA << ", " << nameB << ");\n";
+            } else {
+                out << "std::swap(*" << nameA << ", *" << nameB << ");\n";
+            }
             PRINT_END_COMMENT(out);
         }
 

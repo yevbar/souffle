@@ -43,6 +43,7 @@
 #include "ram/Scan.h"
 #include "ram/Sequence.h"
 #include "ram/Statement.h"
+#include "ram/Swap.h"
 #include "ram/True.h"
 #include "ram/TupleElement.h"
 #include "ram/UnsignedConstant.h"
@@ -70,6 +71,12 @@ std::string diffMinusName(const ast::Relation* rel) {
 // like the diff relations (an @-prefix would make it a temporary that a RAM transform removes as unused).
 std::string dirtyName(const ast::Relation* rel) {
     return getConcreteRelationName(rel->getQualifiedName(), "__dirty_");
+}
+// A temporary (@-prefixed, so its Clear is unconditional even inside a subroutine) used to empty a relation
+// cheaply: Swap(R, @swap_R) moves R's contents into the temp (an O(1) btree content swap — see the Swap
+// synthesiser visitor), which is then bulk-purged, far cheaper than erasing R tuple by tuple.
+std::string swapName(const ast::Relation* rel) {
+    return getConcreteRelationName(rel->getQualifiedName(), "@swap_");
 }
 
 // Rewrites one clause's RAM into a delta version: ranges the `target`-th scan (pre-order) over its
@@ -239,14 +246,14 @@ Own<ram::Statement> UnitTranslator::generateStratumRecompute(
     VecOwn<ram::Statement> result;
     const bool recursive = context->isRecursiveSCC(sccNumber);
 
-    // Empty each relation: copy it to the diff_minus scratch, then erase those tuples. (A cheaper Swap-based
-    // clear does NOT work here: std::swap exchanges the relation objects but the RelationWrapper that backs
-    // getRelation does not follow, so the driver would then read the wrong object. Swap is only safe for the
-    // unexposed @delta/@new temporaries.)
+    // Empty each relation cheaply: swap its contents into the @swap temp (O(1) btree swap), then bulk-purge
+    // the temp. This avoids erasing R tuple by tuple (the dominant cost — erase is O(|R|) costly btree_delete
+    // operations). The Swap synthesiser visitor swaps object CONTENTS for exposed relations, so getRelation
+    // still sees the right object.
     for (const ast::Relation* rel : scc) {
         const std::string mainName = getConcreteRelationName(rel->getQualifiedName());
-        appendStmt(result, generateMergeRelations(rel, diffMinusName(rel), mainName));
-        appendStmt(result, generateEraseAll(rel, mainName, diffMinusName(rel)));
+        appendStmt(result, mk<ram::Swap>(mainName, swapName(rel)));
+        appendStmt(result, mk<ram::Clear>(swapName(rel)));
     }
 
     // A relation that is BOTH read from input AND has rules holds (input facts ∪ derived facts). Emptying it
@@ -293,6 +300,8 @@ VecOwn<ram::Relation> UnitTranslator::createRamRelations(const std::vector<std::
         for (const ast::Relation* rel : context->getRelationsInSCC(scc)) {
             ramRelations.push_back(createRamRelation(rel, diffPlusName(rel), RelationRepresentation::DEFAULT));
             ramRelations.push_back(createRamRelation(rel, diffMinusName(rel), RelationRepresentation::DEFAULT));
+            // @swap_<R>: a temporary of the same shape, for swap-based clearing.
+            ramRelations.push_back(createRamRelation(rel, swapName(rel), RelationRepresentation::DEFAULT));
             // __dirty_<R>: a nullary "ran" flag (no auxiliary columns) — the cheap dirty signal.
             ramRelations.push_back(mk<ram::Relation>(dirtyName(rel), 0, 0, std::vector<std::string>{},
                     std::vector<std::string>{}, RelationRepresentation::DEFAULT));
