@@ -143,6 +143,11 @@ std::set<std::string> UnitTranslator::stratumDependencies(const ast::RelationSet
     }
     std::set<std::string> deps;
     for (const ast::Relation* rel : scc) {
+        // A relation read from input is its own dependency: its staged input diff can change it even when
+        // none of the relations it reads changed, so the guard must check its own diff_plus/diff_minus too.
+        if (!context->getLoadDirectives(rel->getQualifiedName()).empty()) {
+            deps.insert(getConcreteRelationName(rel->getQualifiedName()));
+        }
         for (const auto* clause : context->getProgram()->getClauses(*rel)) {
             visit(*clause, [&](const ast::Atom& atom) {
                 std::string name = getConcreteRelationName(atom.getQualifiedName());
@@ -214,6 +219,17 @@ Own<ram::Statement> UnitTranslator::generateStratumRecompute(
         const std::string mainName = getConcreteRelationName(rel->getQualifiedName());
         appendStmt(result, generateMergeRelations(rel, diffMinusName(rel), mainName));
         appendStmt(result, generateEraseAll(rel, mainName, diffMinusName(rel)));
+    }
+
+    // A relation that is BOTH read from input AND has rules holds (input facts ∪ derived facts). Emptying it
+    // above dropped its input facts too, so re-apply the staged input from diff_plus before re-deriving. (The
+    // driver stages the full input for such relations.) This runs before the merge-to-diff_minus reuse of the
+    // erase scratch is overwritten — the scratch already holds the old contents.
+    for (const ast::Relation* rel : scc) {
+        if (!context->getLoadDirectives(rel->getQualifiedName()).empty()) {
+            appendStmt(result, generateMergeRelations(
+                                       rel, getConcreteRelationName(rel->getQualifiedName()), diffPlusName(rel)));
+        }
     }
 
     // Re-run the standard from-scratch evaluation over the (already patched) dependencies.
