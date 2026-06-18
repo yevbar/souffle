@@ -27,6 +27,7 @@
 #include "ast2ram/utility/TranslatorContext.h"
 #include "ast2ram/utility/Utils.h"
 #include "ram/Assign.h"
+#include "ram/Break.h"
 #include "ram/Clear.h"
 #include "ram/Condition.h"
 #include "ram/Conjunction.h"
@@ -52,6 +53,7 @@
 #include "ram/UndefValue.h"
 #include "ram/UnsignedConstant.h"
 #include "ram/Variable.h"
+#include "ram/utility/Utils.h"
 #include "ram/utility/Visitor.h"
 #include "souffle/utility/ContainerUtil.h"
 #include "souffle/utility/MiscUtil.h"
@@ -118,22 +120,111 @@ struct DeltaRewriter : public ram::NodeMapper {
 };
 
 // Strips souffle's emptiness-check OPTIMIZATION guards — `Filter(Negation(EmptinessCheck(R)), op)` ("run op
-// only if R is non-empty") — by replacing them with `op`. The guard names the body atom's ORIGINAL relation,
-// but a delta rule redirects that scan to a diff relation; when a deletion empties R the guard would wrongly
-// skip the over-delete (so the head is never retracted). Removing the guard is semantically a no-op (the scan
-// iterates an empty relation harmlessly) and the only cost is losing an early-out on a small diff rule.
-// A NEGATED atom is `Filter(Negation(ExistenceCheck(...)))` (ExistenceCheck, not EmptinessCheck) and a nullary
-// negation is `Filter(EmptinessCheck(...))` (no Negation) — neither matches, so both are preserved.
+// only if R is non-empty") — for the SCANNED relations only (R in `scanned`), by replacing them with `op`. The
+// guard names the body atom's ORIGINAL relation, but a delta rule redirects that scan to a diff relation; when
+// a deletion empties R the guard would wrongly skip the over-delete (so the head is never retracted). Removing
+// it is a semantic no-op (the scan iterates an empty relation harmlessly), only losing an early-out.
+// CRUCIAL: a POSITIVE NULLARY body atom `R()` is ALSO `Filter(Negation(EmptinessCheck(R)))` but R is never
+// scanned (it has no data columns) — that one is a real body literal and must be PRESERVED (and instead gets
+// its own delta version, see NullaryAtomRewriter). So strip only when R is a scanned relation.
 struct EmptinessGuardStripper : public ram::NodeMapper {
+    const std::set<std::string>& scanned;
+    explicit EmptinessGuardStripper(const std::set<std::string>& scanned) : scanned(scanned) {}
+
+    // A conjunction term `Negation(EmptinessCheck(R))` with R a scanned relation — the optimization guard.
+    bool isScannedGuard(const ram::Condition* c) const {
+        if (const auto* neg = as<ram::Negation>(c)) {
+            if (const auto* ec = as<ram::EmptinessCheck>(&neg->getOperand())) {
+                return scanned.count(ec->getRelation()) != 0u;
+            }
+        }
+        return false;
+    }
+
     Own<ram::Node> operator()(Own<ram::Node> node) const override {
         if (const auto* filter = as<ram::Filter>(node.get())) {
-            if (const auto* neg = as<ram::Negation>(&filter->getCondition())) {
+            // The guard may be a single term or a Conjunction (souffle merges the per-atom emptiness checks).
+            // Drop only the scanned-relation emptiness terms; keep everything else (other conditions, and a
+            // POSITIVE NULLARY body atom `R()` whose R is never scanned).
+            VecOwn<ram::Condition> kept;
+            for (auto& term : toConjunctionList(&filter->getCondition())) {
+                if (!isScannedGuard(term.get())) {
+                    kept.push_back(clone(term));
+                }
+            }
+            if (kept.size() != toConjunctionList(&filter->getCondition()).size()) {
+                auto inner = clone(filter->getOperation());
+                inner->apply(*this);
+                if (kept.empty()) {
+                    return inner;
+                }
+                return mk<ram::Filter>(toCondition(kept), std::move(inner));
+            }
+        }
+        // The nullary-head dedup `Break(Negation(EmptinessCheck(head)), op)` ("stop once head is derived")
+        // names the ORIGINAL head, but a delta rule inserts into diff_<head>; with the full head already
+        // non-empty the Break fires immediately and the over-delete never produces its candidate. The insert is
+        // idempotent (a nullary tuple), so removing the dedup is correct. In a non-recursive clause this is the
+        // only Break, so strip it unconditionally.
+        if (const auto* brk = as<ram::Break>(node.get())) {
+            if (const auto* neg = as<ram::Negation>(&brk->getCondition())) {
                 if (as<ram::EmptinessCheck>(&neg->getOperand()) != nullptr) {
-                    auto inner = clone(filter->getOperation());
+                    auto inner = clone(brk->getOperation());
                     inner->apply(*this);
                     return inner;
                 }
             }
+        }
+        node->apply(*this);
+        return node;
+    }
+};
+
+// True iff a Filter's condition is `Negation(EmptinessCheck(R))` for a NON-scanned (nullary) relation R — i.e.
+// a positive nullary body atom `R()`. Returns R's name (or empty if not such an atom).
+inline std::string nullaryAtomOf(const ram::Filter* filter, const std::set<std::string>& scanned) {
+    if (const auto* neg = as<ram::Negation>(&filter->getCondition())) {
+        if (const auto* ec = as<ram::EmptinessCheck>(&neg->getOperand())) {
+            if (scanned.count(ec->getRelation()) == 0u) {
+                return ec->getRelation();
+            }
+        }
+    }
+    return "";
+}
+
+// Redirects the `target`-th positive NULLARY body atom `R()` to range over `<scanPrefix><R>` (its diff), so a
+// change to the nullary R drives a delta version (generateDeltaRules' per-scan loop never covers a nullary atom
+// — it is an existence check, not a scan). Also redirects every head Insert to `<headPrefix><head>`.
+struct NullaryAtomRewriter : public ram::NodeMapper {
+    std::size_t target;
+    std::string scanPrefix;
+    std::string headPrefix;
+    const std::set<std::string>& scanned;
+    mutable std::size_t idx = 0;
+    NullaryAtomRewriter(std::size_t target, std::string scanPrefix, std::string headPrefix,
+            const std::set<std::string>& scanned)
+            : target(target), scanPrefix(std::move(scanPrefix)), headPrefix(std::move(headPrefix)),
+              scanned(scanned) {}
+    Own<ram::Node> operator()(Own<ram::Node> node) const override {
+        if (const auto* filter = as<ram::Filter>(node.get())) {
+            std::string rel = nullaryAtomOf(filter, scanned);
+            if (!rel.empty()) {
+                if (idx++ == target) {
+                    auto inner = clone(filter->getOperation());
+                    inner->apply(*this);
+                    return mk<ram::Filter>(
+                            mk<ram::Negation>(mk<ram::EmptinessCheck>(scanPrefix + rel)), std::move(inner));
+                }
+            }
+        }
+        if (const auto* insert = as<ram::Insert>(node.get())) {
+            node->apply(*this);
+            VecOwn<ram::Expression> values;
+            for (const auto* value : insert->getValues()) {
+                values.push_back(clone(value));
+            }
+            return mk<ram::Insert>(headPrefix + insert->getRelation(), std::move(values));
         }
         node->apply(*this);
         return node;
@@ -286,16 +377,35 @@ Own<ram::Statement> UnitTranslator::generateDeltaRules(const ast::Relation& rel,
         if (!includeRecursive && context->isRecursiveClause(clause)) {
             continue;
         }
-        // Translate the clause normally (over the real relations, so the analyses are satisfied), then emit
-        // one delta version per scan via a RAM-level relation rename.
+        // Translate the clause normally (over the real relations, so the analyses are satisfied), then emit one
+        // delta version per body atom that READS a relation — a SCAN (a data-carrying atom) or a positive
+        // NULLARY atom (an existence check) — redirecting that atom to its diff via a RAM-level rename.
         auto base = context->translateNonRecursiveClause(*clause);
+        std::set<std::string> scanned;
         std::size_t numScans = 0;
-        visit(*base, [&](const ram::Scan&) { numScans++; });
+        visit(*base, [&](const ram::Scan& s) {
+            scanned.insert(s.getRelation());
+            numScans++;
+        });
+        std::size_t numNullary = 0;
+        visit(*base, [&](const ram::Filter& f) {
+            if (!nullaryAtomOf(&f, scanned).empty()) {
+                numNullary++;
+            }
+        });
         for (std::size_t i = 0; i < numScans; i++) {
             auto version = clone(base);
             DeltaRewriter rewriter(i, scanPrefix, headPrefix);
             version->apply(rewriter);
-            EmptinessGuardStripper stripper;  // the redirected scan's old emptiness guard would mis-skip
+            EmptinessGuardStripper stripper(scanned);  // the redirected scan's old emptiness guard would mis-skip
+            version->apply(stripper);
+            appendStmt(result, std::move(version));
+        }
+        for (std::size_t j = 0; j < numNullary; j++) {
+            auto version = clone(base);
+            NullaryAtomRewriter rewriter(j, scanPrefix, headPrefix, scanned);
+            version->apply(rewriter);
+            EmptinessGuardStripper stripper(scanned);
             version->apply(stripper);
             appendStmt(result, std::move(version));
         }
