@@ -148,6 +148,110 @@ struct RederiveRestrictor : public ram::NodeMapper {
         return node;
     }
 };
+
+// True iff a Filter's condition is exactly `Negation(ExistenceCheck(...))` — i.e. it is a negated body atom
+// (as emitted by the incremental ConstraintTranslator for every arity). Returns the inner existence check.
+inline const ram::ExistenceCheck* negatedAtomOf(const ram::Filter* filter) {
+    if (const auto* neg = as<ram::Negation>(&filter->getCondition())) {
+        return as<ram::ExistenceCheck>(&neg->getOperand());
+    }
+    return nullptr;
+}
+
+// Count the negated body atoms in a translated clause.
+inline std::size_t countNegatedAtoms(const ram::Node& clauseRam) {
+    std::size_t n = 0;
+    visit(clauseRam, [&](const ram::Filter& f) {
+        if (negatedAtomOf(&f) != nullptr) {
+            n++;
+        }
+    });
+    return n;
+}
+
+// Negation-delta over-deletion: rewrites the `target`-th negated atom `!N` into a POSITIVE existence check over
+// `<scanPrefix><N>` (its newly-gained tuples), and the head Insert to `<headPrefix><H>`.
+struct NegOverDeleteRewriter : public ram::NodeMapper {
+    std::size_t target;
+    std::string scanPrefix;
+    std::string headPrefix;
+    mutable std::size_t negIdx = 0;
+    NegOverDeleteRewriter(std::size_t target, std::string scanPrefix, std::string headPrefix)
+            : target(target), scanPrefix(std::move(scanPrefix)), headPrefix(std::move(headPrefix)) {}
+
+    Own<ram::Node> operator()(Own<ram::Node> node) const override {
+        if (as<ram::Filter>(node.get()) != nullptr && negatedAtomOf(as<ram::Filter>(node.get())) != nullptr) {
+            bool hit = (negIdx++ == target);
+            node->apply(*this);  // rename the head Insert and rewrite any deeper negated atoms, in place
+            if (hit) {
+                const auto* filter = as<ram::Filter>(node.get());
+                const auto* ec = negatedAtomOf(filter);
+                VecOwn<ram::Expression> values;
+                for (const auto* v : ec->getValues()) {
+                    values.push_back(clone(v));
+                }
+                return mk<ram::Filter>(
+                        mk<ram::ExistenceCheck>(scanPrefix + ec->getRelation(), std::move(values)),
+                        clone(filter->getOperation()));
+            }
+            return node;
+        }
+        if (const auto* insert = as<ram::Insert>(node.get())) {
+            node->apply(*this);
+            VecOwn<ram::Expression> values;
+            for (const auto* value : insert->getValues()) {
+                values.push_back(clone(value));
+            }
+            return mk<ram::Insert>(headPrefix + insert->getRelation(), std::move(values));
+        }
+        node->apply(*this);
+        return node;
+    }
+};
+
+// Negation-delta insertion: keeps the `target`-th negated atom's `!N` check (true now) AND additionally
+// requires it in `<scanPrefix><N>` (its newly-lost tuples); the head Insert is redirected to `<headPrefix><H>`.
+struct NegInsertRewriter : public ram::NodeMapper {
+    std::size_t target;
+    std::string scanPrefix;
+    std::string headPrefix;
+    mutable std::size_t negIdx = 0;
+    NegInsertRewriter(std::size_t target, std::string scanPrefix, std::string headPrefix)
+            : target(target), scanPrefix(std::move(scanPrefix)), headPrefix(std::move(headPrefix)) {}
+
+    Own<ram::Node> operator()(Own<ram::Node> node) const override {
+        if (as<ram::Filter>(node.get()) != nullptr && negatedAtomOf(as<ram::Filter>(node.get())) != nullptr) {
+            bool hit = (negIdx++ == target);
+            node->apply(*this);
+            if (hit) {
+                const auto* filter = as<ram::Filter>(node.get());
+                const auto* ec = negatedAtomOf(filter);
+                VecOwn<ram::Expression> keep, gained;
+                for (const auto* v : ec->getValues()) {
+                    keep.push_back(clone(v));
+                }
+                for (const auto* v : ec->getValues()) {
+                    gained.push_back(clone(v));
+                }
+                auto cond = mk<ram::Conjunction>(
+                        mk<ram::Negation>(mk<ram::ExistenceCheck>(ec->getRelation(), std::move(keep))),
+                        mk<ram::ExistenceCheck>(scanPrefix + ec->getRelation(), std::move(gained)));
+                return mk<ram::Filter>(std::move(cond), clone(filter->getOperation()));
+            }
+            return node;
+        }
+        if (const auto* insert = as<ram::Insert>(node.get())) {
+            node->apply(*this);
+            VecOwn<ram::Expression> values;
+            for (const auto* value : insert->getValues()) {
+                values.push_back(clone(value));
+            }
+            return mk<ram::Insert>(headPrefix + insert->getRelation(), std::move(values));
+        }
+        node->apply(*this);
+        return node;
+    }
+};
 }  // namespace
 
 Own<ram::Statement> UnitTranslator::generateDeltaRules(const ast::Relation& rel,
@@ -239,6 +343,9 @@ std::set<std::string> UnitTranslator::stratumSignals(const ast::RelationSet& scc
 Own<ram::Statement> UnitTranslator::generateIncrementalNonRecursive(const ast::Relation& rel) const {
     VecOwn<ram::Statement> result;
     appendStmt(result, generateDeltaRules(rel, "diff_plus_", "diff_plus_", /* includeRecursive */ false));
+    // Negation sign-flips: a negated atom that just became FALSE (its blocker removed) newly derives head
+    // tuples into diff_plus_<H>. A no-op for negation-free relations.
+    appendStmt(result, generateNegationInsert(rel));
     // Publish the newly-derived tuples into the full relation.
     appendStmt(result, generateMergeRelations(
                                &rel, getConcreteRelationName(rel.getQualifiedName()), diffPlusName(&rel)));
@@ -263,6 +370,42 @@ Own<ram::Statement> UnitTranslator::generateRederiveCandidates(const ast::Relati
     return mk<ram::Sequence>(std::move(result));
 }
 
+Own<ram::Statement> UnitTranslator::generateNegationOverDelete(const ast::Relation& rel) const {
+    VecOwn<ram::Statement> result;
+    for (auto&& clause : context->getProgram()->getClauses(rel)) {
+        if (isA<ast::SubsumptiveClause>(clause) || context->isRecursiveClause(clause)) {
+            continue;
+        }
+        auto base = context->translateNonRecursiveClause(*clause);
+        std::size_t numNeg = countNegatedAtoms(*base);
+        for (std::size_t i = 0; i < numNeg; i++) {
+            auto version = clone(base);
+            NegOverDeleteRewriter rewriter(i, "diff_plus_", "diff_minus_");
+            version->apply(rewriter);
+            appendStmt(result, std::move(version));
+        }
+    }
+    return mk<ram::Sequence>(std::move(result));
+}
+
+Own<ram::Statement> UnitTranslator::generateNegationInsert(const ast::Relation& rel) const {
+    VecOwn<ram::Statement> result;
+    for (auto&& clause : context->getProgram()->getClauses(rel)) {
+        if (isA<ast::SubsumptiveClause>(clause) || context->isRecursiveClause(clause)) {
+            continue;
+        }
+        auto base = context->translateNonRecursiveClause(*clause);
+        std::size_t numNeg = countNegatedAtoms(*base);
+        for (std::size_t i = 0; i < numNeg; i++) {
+            auto version = clone(base);
+            NegInsertRewriter rewriter(i, "diff_minus_", "diff_plus_");
+            version->apply(rewriter);
+            appendStmt(result, std::move(version));
+        }
+    }
+    return mk<ram::Sequence>(std::move(result));
+}
+
 Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relation& rel) const {
     // DRed-style deletion for a non-recursive relation:
     //   1. over-delete: the delta rules over diff_minus of dependencies compute the candidate deletions into
@@ -273,6 +416,9 @@ Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relatio
     //      when there are no deletions (diff_minus empty), which is what makes an insertion-only update O(diff).
     VecOwn<ram::Statement> result;
     appendStmt(result, generateDeltaRules(rel, "diff_minus_", "diff_minus_", /* includeRecursive */ false));
+    // Negation sign-flips: a negated atom that just became TRUE also over-deletes (its candidates join the
+    // positive ones in diff_minus_<H> before the erase). A no-op for negation-free relations.
+    appendStmt(result, generateNegationOverDelete(rel));
     appendStmt(result, generateEraseAll(&rel, getConcreteRelationName(rel.getQualifiedName()),
                                getConcreteRelationName(rel.getQualifiedName(), "diff_minus_")));
     appendStmt(result, generateRederiveCandidates(rel));
@@ -378,8 +524,10 @@ std::set<std::size_t> UnitTranslator::computeDeltaEligible(
         }
     }
 
-    // A stratum is "locally delta-able" iff it is non-recursive and no clause of any of its relations uses
-    // negation or an aggregate. (EDB strata have no clauses, so they pass trivially.)
+    // A stratum is "locally delta-able" iff it is non-recursive and no clause of any of its relations uses an
+    // aggregate. Negation IS supported now (the negation-delta rules seed the three-term update from sign
+    // flips); aggregates still force a recompute (they must see the whole relation). EDB strata have no
+    // clauses, so they pass trivially.
     auto localDeltaable = [&](std::size_t scc) {
         if (context->isRecursiveSCC(scc)) {
             return false;
@@ -387,7 +535,6 @@ std::set<std::size_t> UnitTranslator::computeDeltaEligible(
         bool clean = true;
         for (const ast::Relation* rel : context->getRelationsInSCC(scc)) {
             for (const auto* clause : program->getClauses(*rel)) {
-                visit(*clause, [&](const ast::Negation&) { clean = false; });
                 visit(*clause, [&](const ast::Aggregator&) { clean = false; });
             }
         }

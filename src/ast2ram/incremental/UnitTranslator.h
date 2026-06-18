@@ -134,6 +134,23 @@ private:
      */
     Own<ram::Statement> generateRederiveCandidates(const ast::Relation& rel) const;
 
+    /**
+     * Negation-delta OVER-DELETION: for each negated body atom `!N`, emit a delta rule that ranges that atom
+     * over `diff_plus_<N>` (the tuples N just gained) instead of checking `!N`, with the head Insert redirected
+     * to `diff_minus_<H>`. A head tuple whose positive body still holds but whose negated atom just became true
+     * is no longer supported via that clause — an over-deletion candidate (the candidate-restricted re-derive
+     * then keeps any with an alternative support). One version per negated atom; a no-op for neg-free clauses.
+     */
+    Own<ram::Statement> generateNegationOverDelete(const ast::Relation& rel) const;
+
+    /**
+     * Negation-delta INSERTION: for each negated body atom `!N`, emit a delta rule that keeps the `!N` check
+     * (true now) AND additionally requires the atom in `diff_minus_<N>` (the tuples N just lost), with the head
+     * Insert redirected to `diff_plus_<H>`. A head tuple becomes newly derivable when a blocking negated atom is
+     * removed. One version per negated atom; a no-op for neg-free clauses.
+     */
+    Own<ram::Statement> generateNegationInsert(const ast::Relation& rel) const;
+
     /** Report the two auxiliary columns to the IO directives so they are stripped on write. */
     void addAuxiliaryArity(
             const ast::Relation* relation, std::map<std::string, std::string>& directives) const override;
