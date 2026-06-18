@@ -26,6 +26,7 @@
 #include "ast2ram/utility/TranslatorContext.h"
 #include "ast2ram/utility/Utils.h"
 #include "ram/Assign.h"
+#include "ram/Erase.h"
 #include "ram/Insert.h"
 #include "ram/IntrinsicOperator.h"
 #include "ram/Loop.h"
@@ -49,27 +50,31 @@
 namespace souffle::ast2ram::incremental {
 
 namespace {
-// The staging relation that holds tuples inserted into <R> for the next update.
+// The staging relations that hold tuples inserted into / deleted from <R> for the next update.
 std::string diffPlusName(const ast::Relation* rel) {
     return getConcreteRelationName(rel->getQualifiedName(), "diff_plus_");
 }
+std::string diffMinusName(const ast::Relation* rel) {
+    return getConcreteRelationName(rel->getQualifiedName(), "diff_minus_");
+}
 
-// Rewrites one clause's RAM into a delta version: ranges the `target`-th scan (pre-order) over its diff_plus
-// relation, and redirects every insert to `<headPrefix><head relation>`. The auxiliary columns are preserved
-// (the tuple shape is unchanged). Profile text is dropped (irrelevant to the delta rule).
+// Rewrites one clause's RAM into a delta version: ranges the `target`-th scan (pre-order) over its
+// `<scanPrefix>` relation, and redirects every insert to `<headPrefix><head relation>`. The auxiliary columns
+// are preserved (the tuple shape is unchanged). Profile text is dropped (irrelevant to the delta rule).
 struct DeltaRewriter : public ram::NodeMapper {
     std::size_t target;
+    std::string scanPrefix;
     std::string headPrefix;
     mutable std::size_t scanIdx = 0;
-    DeltaRewriter(std::size_t target, std::string headPrefix)
-            : target(target), headPrefix(std::move(headPrefix)) {}
+    DeltaRewriter(std::size_t target, std::string scanPrefix, std::string headPrefix)
+            : target(target), scanPrefix(std::move(scanPrefix)), headPrefix(std::move(headPrefix)) {}
 
     Own<ram::Node> operator()(Own<ram::Node> node) const override {
         if (const auto* scan = as<ram::Scan>(node.get())) {
             std::size_t idx = scanIdx++;
             node->apply(*this);  // rewrite nested operations first
             if (idx == target) {
-                return mk<ram::Scan>("diff_plus_" + scan->getRelation(), scan->getTupleId(),
+                return mk<ram::Scan>(scanPrefix + scan->getRelation(), scan->getTupleId(),
                         clone(scan->getOperation()), "");
             }
             return node;
@@ -88,8 +93,8 @@ struct DeltaRewriter : public ram::NodeMapper {
 };
 }  // namespace
 
-Own<ram::Statement> UnitTranslator::generateDeltaRules(
-        const ast::Relation& rel, const std::string& headPrefix, bool includeRecursive) const {
+Own<ram::Statement> UnitTranslator::generateDeltaRules(const ast::Relation& rel,
+        const std::string& scanPrefix, const std::string& headPrefix, bool includeRecursive) const {
     VecOwn<ram::Statement> result;
     for (auto&& clause : context->getProgram()->getClauses(rel)) {
         if (isA<ast::SubsumptiveClause>(clause)) {
@@ -105,7 +110,7 @@ Own<ram::Statement> UnitTranslator::generateDeltaRules(
         visit(*base, [&](const ram::Scan&) { numScans++; });
         for (std::size_t i = 0; i < numScans; i++) {
             auto version = clone(base);
-            DeltaRewriter rewriter(i, headPrefix);
+            DeltaRewriter rewriter(i, scanPrefix, headPrefix);
             version->apply(rewriter);
             appendStmt(result, std::move(version));
         }
@@ -113,12 +118,38 @@ Own<ram::Statement> UnitTranslator::generateDeltaRules(
     return mk<ram::Sequence>(std::move(result));
 }
 
+// Erase from `destRelation` every tuple in `srcRelation`, copying all columns (data + the two auxiliary
+// columns). The relation keys on the data columns, so the auxiliary values supplied do not affect the match.
+Own<ram::Statement> UnitTranslator::generateEraseAll(
+        const ast::Relation* rel, const std::string& destRelation, const std::string& srcRelation) const {
+    VecOwn<ram::Expression> values;
+    for (std::size_t i = 0; i < rel->getArity() + 2; i++) {
+        values.push_back(mk<ram::TupleElement>(0, i));
+    }
+    return mk<ram::Query>(mk<ram::Scan>(srcRelation, 0, mk<ram::Erase>(destRelation, std::move(values))));
+}
+
 Own<ram::Statement> UnitTranslator::generateIncrementalNonRecursive(const ast::Relation& rel) const {
     VecOwn<ram::Statement> result;
-    appendStmt(result, generateDeltaRules(rel, "diff_plus_", /* includeRecursive */ false));
+    appendStmt(result, generateDeltaRules(rel, "diff_plus_", "diff_plus_", /* includeRecursive */ false));
     // Publish the newly-derived tuples into the full relation.
     appendStmt(result, generateMergeRelations(
                                &rel, getConcreteRelationName(rel.getQualifiedName()), diffPlusName(&rel)));
+    return mk<ram::Sequence>(std::move(result));
+}
+
+Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relation& rel) const {
+    // DRed-style deletion for a non-recursive relation:
+    //   1. over-delete: the delta rules over diff_minus of dependencies compute the candidate deletions into
+    //      diff_minus_<R> (tuples derived using a now-deleted tuple);
+    //   2. erase those candidates from <R>;
+    //   3. re-derive <R> from the surviving relations — re-adds any candidate that still has support, and is a
+    //      no-op (set dedup) for the untouched tuples. Sound for monotone programs.
+    VecOwn<ram::Statement> result;
+    appendStmt(result, generateDeltaRules(rel, "diff_minus_", "diff_minus_", /* includeRecursive */ false));
+    appendStmt(result, generateEraseAll(&rel, getConcreteRelationName(rel.getQualifiedName()),
+                               getConcreteRelationName(rel.getQualifiedName(), "diff_minus_")));
+    appendStmt(result, generateNonRecursiveRelation(rel));
     return mk<ram::Sequence>(std::move(result));
 }
 
@@ -130,7 +161,7 @@ Own<ram::Statement> UnitTranslator::generateIncrementalRecursive(
     // the version that ranges a same-SCC atom over its empty diff_plus is a harmless no-op), then merge the
     // seed into the full relation.
     for (const ast::Relation* rel : scc) {
-        appendStmt(result, generateDeltaRules(*rel, "@delta_", /* includeRecursive */ true));
+        appendStmt(result, generateDeltaRules(*rel, "diff_plus_", "@delta_", /* includeRecursive */ true));
     }
     for (const ast::Relation* rel : scc) {
         appendStmt(result, generateMergeRelations(rel, getConcreteRelationName(rel->getQualifiedName()),
@@ -170,6 +201,7 @@ VecOwn<ram::Relation> UnitTranslator::createRamRelations(const std::vector<std::
     for (auto scc : sccOrdering) {
         for (const ast::Relation* rel : context->getRelationsInSCC(scc)) {
             ramRelations.push_back(createRamRelation(rel, diffPlusName(rel), RelationRepresentation::DEFAULT));
+            ramRelations.push_back(createRamRelation(rel, diffMinusName(rel), RelationRepresentation::DEFAULT));
         }
     }
     return ramRelations;

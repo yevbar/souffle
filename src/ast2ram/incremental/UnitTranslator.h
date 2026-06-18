@@ -66,14 +66,25 @@ private:
      * The union over scans is the derivations using at least one newly-inserted tuple. `includeRecursive`
      * controls whether recursive clauses are included (true when seeding a recursive stratum's @delta).
      */
-    Own<ram::Statement> generateDeltaRules(
-            const ast::Relation& rel, const std::string& headPrefix, bool includeRecursive) const;
+    Own<ram::Statement> generateDeltaRules(const ast::Relation& rel, const std::string& scanPrefix,
+            const std::string& headPrefix, bool includeRecursive) const;
+
+    /** Erase every tuple of `srcRelation` (all columns incl. auxiliary) from `destRelation`. */
+    Own<ram::Statement> generateEraseAll(
+            const ast::Relation* rel, const std::string& destRelation, const std::string& srcRelation) const;
 
     /**
      * Incremental delta evaluation of a non-recursive relation: the delta rules into `diff_plus_<R>`, then
      * merge into <R>. Only sound for monotone programs.
      */
     Own<ram::Statement> generateIncrementalNonRecursive(const ast::Relation& rel) const;
+
+    /**
+     * DRed-style incremental deletion of a non-recursive relation: over-delete candidates into
+     * `diff_minus_<R>`, erase them from <R>, then re-derive from the survivors. Only sound for monotone
+     * programs.
+     */
+    Own<ram::Statement> generateIncrementalDelete(const ast::Relation& rel) const;
 
     /**
      * Incremental evaluation of a recursive stratum: seed each relation's @delta with the new tuples (delta
