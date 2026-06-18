@@ -492,6 +492,32 @@ Own<ram::Statement> UnitTranslator::generateStratumRecompute(
 }
 
 VecOwn<ram::Relation> UnitTranslator::createRamRelations(const std::vector<std::size_t>& sccOrdering) const {
+    // Decide, BEFORE the relations are built, which MAIN relations the update erases — only those need the
+    // (slower) deletion-capable btree. This must MIRROR generateProgram's per-stratum branch exactly: a
+    // non-recursive stratum is erased iff it is EDB (the EDB branch erases its diff_minus deletions) or
+    // intensional taking the delta path (generateIncrementalDelete erases its over-delete candidates), which is
+    // when the program is globally monotone OR the stratum is delta-eligible. Recursive strata and non-eligible
+    // intensional strata of a non-monotone program swap-clear instead of erasing, so they stay on the fast
+    // btree — and they carry the O(|R|) recompute work at scale, so this is the representation that matters.
+    erasedRelations.clear();
+    const std::set<std::size_t> eligible = computeDeltaEligible(sccOrdering);
+    const ast::Program* program = context->getProgram();
+    bool monotone = true;
+    visit(*program, [&](const ast::Negation&) { monotone = false; });
+    visit(*program, [&](const ast::Aggregator&) { monotone = false; });
+    for (std::size_t scc : sccOrdering) {
+        if (context->isRecursiveSCC(scc)) {
+            continue;  // recursive strata recompute (swap-clear), never erased
+        }
+        const auto& sccRels = context->getRelationsInSCC(scc);
+        for (const ast::Relation* rel : sccRels) {
+            const bool edb = program->getClauses(*rel).empty();
+            if (edb || monotone || eligible.count(scc) != 0u) {
+                erasedRelations.insert(getConcreteRelationName(rel->getQualifiedName()));
+            }
+        }
+    }
+
     auto ramRelations = seminaive::UnitTranslator::createRamRelations(sccOrdering);
 
     // One `diff_plus_<R>` staging relation per relation (same shape, including the auxiliary columns). The
@@ -668,9 +694,14 @@ Own<ram::Relation> UnitTranslator::createRamRelation(const ast::Relation* baseRe
     attributeNames.push_back("@iteration");
     attributeTypeQualifiers.push_back("i:number");
 
-    // The incremental update erases tuples (DRed deletion), which the default btree representation does not
-    // support — use the deletion-capable btree. Leave non-default representations (e.g. EQREL) untouched.
-    if (representation == RelationRepresentation::DEFAULT || representation == RelationRepresentation::BTREE) {
+    // The incremental update erases tuples (DRed deletion) only from the erase-target MAIN relations (EDB +
+    // delta-eligible intensional — see erasedRelations); those need the deletion-capable btree. Every other
+    // relation (recompute-stratum mains, which swap-clear; and the diff_plus_/diff_minus_/@swap_ relations,
+    // which are scanned/purged/merged but never erased) keeps the FAST btree — this avoids taxing the bulk of
+    // the program (and the recompute strata that dominate at scale) with the slower deletion-capable structure.
+    // Leave non-default representations (e.g. EQREL) untouched.
+    if ((representation == RelationRepresentation::DEFAULT || representation == RelationRepresentation::BTREE) &&
+            erasedRelations.count(ramRelationName) != 0u) {
         representation = RelationRepresentation::BTREE_DELETE;
     }
 

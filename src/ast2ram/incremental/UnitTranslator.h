@@ -158,6 +158,15 @@ private:
     /** Copy the auxiliary columns through when merging @new/@delta into the full relation. */
     Own<ram::Statement> generateMergeRelations(const ast::Relation* rel, const std::string& destRelation,
             const std::string& srcRelation) const override;
+
+    /**
+     * The concrete names of the MAIN relations that the `update` actually erases (`ram::Erase`) — exactly the
+     * EDB relations and the delta-eligible intensional relations. Only these need the deletion-capable
+     * `BTREE_DELETE` representation; everything else (recompute-stratum mains, which swap-clear; and all the
+     * diff_plus_/diff_minus_/@swap_ relations, which are scanned/purged/merged but never erased) keeps the fast
+     * btree. Populated in createRamRelations before the relations are built, read by createRamRelation.
+     */
+    mutable std::set<std::string> erasedRelations;
 };
 
 }  // namespace souffle::ast2ram::incremental
