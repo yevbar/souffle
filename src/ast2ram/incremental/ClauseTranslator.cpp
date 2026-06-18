@@ -54,13 +54,20 @@ void ClauseTranslator::indexAtoms(const ast::Clause& clause) {
 
 Own<ram::Expression> ClauseTranslator::getIterationNumber(const ast::Clause& clause) const {
     const auto& bodyAtoms = getAtomOrdering(clause);
-    if (bodyAtoms.empty()) return mk<ram::SignedConstant>(0);
 
+    // Only SCANNED atoms bind an @iteration tuple element. A nullary body atom (a proposition) becomes an
+    // existence check, not a scan, so its @iteration_i variable is never bound — reading it produces an
+    // undeclared tuple in the generated code. Skip nullary atoms here; their derivation depth does not
+    // contribute a readable value.
     VecOwn<ram::Expression> depths;
     for (std::size_t i = 0; i < bodyAtoms.size(); i++) {
+        if (bodyAtoms.at(i)->getArity() == 0) {
+            continue;
+        }
         auto iterVar = mk<ast::Variable>("@iteration_" + std::to_string(i));
         depths.push_back(context.translateValue(*valueIndex, iterVar.get()));
     }
+    if (depths.empty()) return mk<ram::SignedConstant>(0);
 
     auto maxDepth = depths.size() == 1 ? std::move(depths.at(0))
                                        : mk<ram::IntrinsicOperator>(FunctorOp::MAX, std::move(depths));
@@ -118,18 +125,22 @@ Own<ram::Operation> ClauseTranslator::createInsertion(const ast::Clause& clause)
         values.push_back(context.translateValue(*valueIndex, arg));
     }
 
-    // @count is a placeholder (1) until multiset accounting lands. @iteration
-    // is the derivation depth: one more than the deepest body atom (0 for a
-    // fact). Set semantics keeps the first derivation, so this records the
-    // depth at which the tuple first appears.
-    values.push_back(mk<ram::SignedConstant>(1));        // @count
-    values.push_back(getIterationNumber(clause));        // @iteration
+    // @count is a placeholder (1) until multiset accounting lands. @iteration is the derivation depth: one
+    // more than the deepest body atom (0 for a fact). Set semantics keeps the first derivation, so this
+    // records the depth at which the tuple first appears.
+    //
+    // A nullary (proposition) head uses a CONSTANT iteration: souffle hoists the insert of a nullary relation
+    // out of the body scan (it is loop-invariant once derived), so a body-dependent value would reference an
+    // out-of-scope tuple. @iteration is internal, stripped state, so the exact depth here does not matter.
+    values.push_back(mk<ram::SignedConstant>(1));  // @count
+    values.push_back(head->getArity() == 0 ? mk<ram::Expression, ram::SignedConstant>(0)
+                                           : getIterationNumber(clause));  // @iteration
 
-    // Propositions
-    if (head->getArity() == 0) {
-        return mk<ram::Filter>(
-                mk<ram::EmptinessCheck>(headRelationName), mk<ram::Insert>(headRelationName, std::move(values)));
-    }
+    // NB: unlike the semi-naive translator we do NOT wrap a nullary (proposition) head in
+    // Filter(EmptinessCheck, Insert). That guard is loop-invariant, so the RAM optimiser hoists the nested
+    // Insert out of the body scan — but our @iteration value reads a body tuple (env0), which is then out of
+    // scope and the generated C++ fails to compile. Inserting directly (the body scan still encloses it) is
+    // correct: set semantics dedups the proposition, and the auxiliary columns are stripped from output.
 
     // Relations with functional dependency constraints
     if (auto guardedConditions = getFunctionalDependencies(clause)) {
