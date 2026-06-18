@@ -17,7 +17,9 @@
 #include "ast2ram/incremental/UnitTranslator.h"
 #include "RelationTag.h"
 #include "ast/Aggregator.h"
+#include "ast/Atom.h"
 #include "ast/Clause.h"
+#include "ast/Literal.h"
 #include "ast/Negation.h"
 #include "ast/Program.h"
 #include "ast/Relation.h"
@@ -51,6 +53,7 @@
 #include "ram/True.h"
 #include "ram/TupleElement.h"
 #include "ram/UndefValue.h"
+#include "ram/SignedConstant.h"
 #include "ram/UnsignedConstant.h"
 #include "ram/Variable.h"
 #include "ram/utility/Utils.h"
@@ -542,6 +545,41 @@ Own<ram::Statement> UnitTranslator::generateNegationInsert(const ast::Relation& 
     return mk<ram::Sequence>(std::move(result));
 }
 
+Own<ram::Statement> UnitTranslator::generateNullaryOverDelete(const ast::Relation& rel) const {
+    VecOwn<ram::Statement> result;
+    const std::string headName = getConcreteRelationName(rel.getQualifiedName());
+    const std::string diffMinusHead = diffMinusName(&rel);
+    std::set<std::string> seen;  // dedup body relations across clauses
+    for (auto&& clause : context->getProgram()->getClauses(rel)) {
+        if (isA<ast::SubsumptiveClause>(clause) || context->isRecursiveClause(clause)) {
+            continue;
+        }
+        for (const auto* lit : clause->getBodyLiterals()) {
+            // A positive body atom B contributes when it loses a tuple (diff_minus_B); a negated atom !N when
+            // N gains one (diff_plus_N). Either can drop support for the proposition.
+            std::string diffRel;
+            if (const auto* atom = as<ast::Atom>(lit)) {
+                diffRel = getConcreteRelationName(atom->getQualifiedName(), "diff_minus_");
+            } else if (const auto* neg = as<ast::Negation>(lit)) {
+                diffRel = getConcreteRelationName(neg->getAtom()->getQualifiedName(), "diff_plus_");
+            } else {
+                continue;
+            }
+            if (!seen.insert(diffRel).second) {
+                continue;
+            }
+            // IF (NOT ISEMPTY(head) AND NOT ISEMPTY(diffRel)) INSERT (0) INTO diff_minus_head
+            VecOwn<ram::Expression> vals;
+            vals.push_back(mk<ram::SignedConstant>(0));  // the single @iteration aux column
+            auto cond = mk<ram::Conjunction>(mk<ram::Negation>(mk<ram::EmptinessCheck>(headName)),
+                    mk<ram::Negation>(mk<ram::EmptinessCheck>(diffRel)));
+            appendStmt(result, mk<ram::Query>(mk<ram::Filter>(std::move(cond),
+                                       mk<ram::Insert>(diffMinusHead, std::move(vals)))));
+        }
+    }
+    return mk<ram::Sequence>(std::move(result));
+}
+
 Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relation& rel) const {
     // DRed-style deletion for a non-recursive relation:
     //   1. over-delete: the delta rules over diff_minus of dependencies compute the candidate deletions into
@@ -551,10 +589,17 @@ Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relatio
     //      support, restricted to the diff_minus_<R> tuples so the cost is O(|diff_minus|) not O(|R|). A no-op
     //      when there are no deletions (diff_minus empty), which is what makes an insertion-only update O(diff).
     VecOwn<ram::Statement> result;
-    appendStmt(result, generateDeltaRules(rel, "diff_minus_", "diff_minus_", /* includeRecursive */ false));
-    // Negation sign-flips: a negated atom that just became TRUE also over-deletes (its candidates join the
-    // positive ones in diff_minus_<H> before the erase). A no-op for negation-free relations.
-    appendStmt(result, generateNegationOverDelete(rel));
+    if (rel.getArity() == 0) {
+        // A NULLARY head (proposition): the per-atom delta over-delete misses simultaneous multi-atom
+        // deletions (it checks the other atoms over their already-emptied current state). Since the head has no
+        // variables, a single conservative candidate is correct and handles any combination of deletions.
+        appendStmt(result, generateNullaryOverDelete(rel));
+    } else {
+        appendStmt(result, generateDeltaRules(rel, "diff_minus_", "diff_minus_", /* includeRecursive */ false));
+        // Negation sign-flips: a negated atom that just became TRUE also over-deletes (its candidates join the
+        // positive ones in diff_minus_<H> before the erase). A no-op for negation-free relations.
+        appendStmt(result, generateNegationOverDelete(rel));
+    }
     appendStmt(result, generateEraseAll(&rel, getConcreteRelationName(rel.getQualifiedName()),
                                getConcreteRelationName(rel.getQualifiedName(), "diff_minus_")));
     appendStmt(result, generateRederiveCandidates(rel));

@@ -151,6 +151,16 @@ private:
      */
     Own<ram::Statement> generateNegationInsert(const ast::Relation& rel) const;
 
+    /**
+     * Conservative over-deletion for a NULLARY head (a proposition, e.g. souffle's +disconnectedN). The
+     * head has no variables, so a single over-delete candidate `()` is correct: if H currently holds and ANY
+     * body relation lost a tuple (`diff_minus_<B>` non-empty) or a negated atom gained one (`diff_plus_<N>`),
+     * mark H deleted; the candidate-restricted re-derive then re-adds it iff the body still holds. Unlike the
+     * per-atom delta over-delete this does not check the OTHER body atoms over their current state, so it is
+     * correct when MULTIPLE body atoms are deleted in the same update (which the per-atom version misses).
+     */
+    Own<ram::Statement> generateNullaryOverDelete(const ast::Relation& rel) const;
+
     /** Report the two auxiliary columns to the IO directives so they are stripped on write. */
     void addAuxiliaryArity(
             const ast::Relation* relation, std::map<std::string, std::string>& directives) const override;
