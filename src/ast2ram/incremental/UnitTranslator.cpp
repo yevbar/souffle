@@ -153,11 +153,13 @@ struct EmptinessGuardStripper : public ram::NodeMapper {
                 }
             }
             if (kept.size() != toConjunctionList(&filter->getCondition()).size()) {
-                auto inner = clone(filter->getOperation());
-                inner->apply(*this);
+                // Dispatch on the operation ITSELF (not its children) so a guard sitting directly under this
+                // one is still processed — `apply` would visit only the child's children and skip it.
+                Own<ram::Node> innerNode = (*this)(clone(filter->getOperation()));
                 if (kept.empty()) {
-                    return inner;
+                    return innerNode;
                 }
+                Own<ram::Operation> inner(as<ram::Operation>(innerNode.release()));
                 return mk<ram::Filter>(toCondition(kept), std::move(inner));
             }
         }
@@ -169,9 +171,8 @@ struct EmptinessGuardStripper : public ram::NodeMapper {
         if (const auto* brk = as<ram::Break>(node.get())) {
             if (const auto* neg = as<ram::Negation>(&brk->getCondition())) {
                 if (as<ram::EmptinessCheck>(&neg->getOperand()) != nullptr) {
-                    auto inner = clone(brk->getOperation());
-                    inner->apply(*this);
-                    return inner;
+                    // Dispatch on the operation itself — the guard directly below would otherwise be skipped.
+                    return (*this)(clone(brk->getOperation()));
                 }
             }
         }
@@ -211,8 +212,9 @@ struct NullaryAtomRewriter : public ram::NodeMapper {
             std::string rel = nullaryAtomOf(filter, scanned);
             if (!rel.empty()) {
                 if (idx++ == target) {
-                    auto inner = clone(filter->getOperation());
-                    inner->apply(*this);
+                    // Dispatch on the operation itself so an Insert directly below gets its head renamed.
+                    Own<ram::Node> innerNode = (*this)(clone(filter->getOperation()));
+                    Own<ram::Operation> inner(as<ram::Operation>(innerNode.release()));
                     return mk<ram::Filter>(
                             mk<ram::Negation>(mk<ram::EmptinessCheck>(scanPrefix + rel)), std::move(inner));
                 }
