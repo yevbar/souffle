@@ -153,31 +153,43 @@ Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relatio
     return mk<ram::Sequence>(std::move(result));
 }
 
-Own<ram::Statement> UnitTranslator::generateIncrementalRecursive(
-        const ast::RelationSet& scc, std::size_t sccNumber) const {
-    // Recompute the recursive stratum, handling insertions AND deletions. A diff-seeded fixpoint propagates
-    // insertions cheaply but does not retract tuples that lost support; getting both right inside a fixpoint
-    // is recursive DRed with re-discovery (future work). Instead: publish the old contents as deletions
-    // (into diff_minus), empty the relation, re-run the standard from-scratch fixpoint over the patched
-    // dependencies, then publish the new contents as insertions (into diff_plus). Correct for insert and
-    // delete; conservative for any downstream stratum (it sees the whole relation replaced, old->diff_minus
-    // and new->diff_plus, which its own update handles).
+Own<ram::Statement> UnitTranslator::generateStratumRecompute(
+        const ast::RelationSet& scc, std::size_t sccNumber, bool publish) const {
+    // Recompute a stratum, correct for insertions, deletions AND negation sign-flips (which add and remove
+    // tuples that a from-scratch evaluation simply gets right). Empty each relation (so no-longer-derivable
+    // tuples disappear), then re-run the standard evaluation over the already-patched dependencies. Used for
+    // recursive monotone strata (a diff-seeded fixpoint can't retract), and for ALL strata of a non-monotone
+    // program (negation makes incremental insertion unsound).
+    //
+    // When `publish` is set, the old contents go to diff_minus and the new contents to diff_plus, so a
+    // downstream incremental (monotone) stratum sees the change. A non-monotone program recomputes every
+    // stratum, so it does not publish (downstream recomputes from the full relations anyway).
     VecOwn<ram::Statement> result;
+    const bool recursive = context->isRecursiveSCC(sccNumber);
 
-    // Old contents -> diff_minus (publish), then erase to empty the relation.
+    // Empty each relation (publishing the old contents as deletions first when requested).
     for (const ast::Relation* rel : scc) {
         const std::string mainName = getConcreteRelationName(rel->getQualifiedName());
         appendStmt(result, generateMergeRelations(rel, diffMinusName(rel), mainName));
         appendStmt(result, generateEraseAll(rel, mainName, diffMinusName(rel)));
     }
 
-    // Re-run the standard from-scratch recursive stratum over the (already patched) dependencies.
-    appendStmt(result, generateRecursiveStratum(scc, sccNumber));
+    // Re-run the standard from-scratch evaluation over the (already patched) dependencies.
+    if (recursive) {
+        appendStmt(result, generateRecursiveStratum(scc, sccNumber));
+    } else {
+        appendStmt(result, generateNonRecursiveRelation(**scc.begin()));
+    }
 
-    // New contents -> diff_plus (publish) for downstream strata.
-    for (const ast::Relation* rel : scc) {
-        appendStmt(result, generateMergeRelations(
-                                   rel, diffPlusName(rel), getConcreteRelationName(rel->getQualifiedName())));
+    // When publishing, expose the new contents as insertions for downstream incremental strata. (The old
+    // contents already sit in diff_minus from the erase scratch above.) Without publishing, the diff_minus
+    // scratch is simply left for the driver to purge — no downstream stratum reads it (they recompute from
+    // the full relations).
+    if (publish) {
+        for (const ast::Relation* rel : scc) {
+            appendStmt(result, generateMergeRelations(
+                                       rel, diffPlusName(rel), getConcreteRelationName(rel->getQualifiedName())));
+        }
     }
     return mk<ram::Sequence>(std::move(result));
 }
@@ -230,11 +242,9 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
         std::size_t scc = sccOrdering.at(i);
         const auto& sccRelations = context->getRelationsInSCC(scc);
         if (context->isRecursiveSCC(scc)) {
-            if (monotone) {
-                appendStmt(body, generateIncrementalRecursive(sccRelations, scc));
-            } else {
-                appendStmt(body, generateRecursiveStratum(sccRelations, scc));
-            }
+            // Recursive strata recompute (a diff-seeded fixpoint can't retract); publish for downstream
+            // incremental strata only when the whole program is monotone.
+            appendStmt(body, generateStratumRecompute(sccRelations, scc, /* publish */ monotone));
         } else if (!sccRelations.empty()) {
             const ast::Relation* rel = *sccRelations.begin();
             if (program->getClauses(*rel).empty()) {
@@ -244,11 +254,12 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
                 appendStmt(body, generateMergeRelations(rel,
                                          getConcreteRelationName(rel->getQualifiedName()), diffPlusName(rel)));
             } else if (monotone) {
-                // Deletion (DRed) then insertion (delta).
+                // Monotone intensional: deletion (DRed) then insertion (delta).
                 appendStmt(body, generateIncrementalDelete(*rel));
                 appendStmt(body, generateIncrementalNonRecursive(*rel));
             } else {
-                appendStmt(body, generateNonRecursiveRelation(*rel));
+                // Non-monotone (negation): recompute the stratum so sign-flips are retracted correctly.
+                appendStmt(body, generateStratumRecompute(sccRelations, scc, /* publish */ false));
             }
         }
     }

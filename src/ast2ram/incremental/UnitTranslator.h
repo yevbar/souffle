@@ -87,14 +87,14 @@ private:
     Own<ram::Statement> generateIncrementalDelete(const ast::Relation& rel) const;
 
     /**
-     * Incremental evaluation of a recursive stratum: seed each relation's @delta with the new tuples (delta
-     * rules into @delta), merge that seed into the full relation, then run the standard semi-naive fixpoint
-     * (which is driven by @delta, so work is proportional to the seed rather than the whole relation), and
-     * conservatively publish the relations into their `diff_plus` for downstream strata. Only sound for
-     * monotone programs.
+     * Recompute a stratum from scratch — empty its relations, then re-run the standard evaluation over the
+     * patched dependencies. Correct for insertions, deletions and negation sign-flips. Used for recursive
+     * strata (a diff-seeded fixpoint can't retract) and for every stratum of a non-monotone program. When
+     * `publish` is set, the old contents go to diff_minus and the new to diff_plus for downstream incremental
+     * strata.
      */
-    Own<ram::Statement> generateIncrementalRecursive(
-            const ast::RelationSet& scc, std::size_t sccNumber) const;
+    Own<ram::Statement> generateStratumRecompute(
+            const ast::RelationSet& scc, std::size_t sccNumber, bool publish) const;
 
     /** Report the two auxiliary columns to the IO directives so they are stripped on write. */
     void addAuxiliaryArity(
