@@ -114,6 +114,17 @@ private:
     Own<ram::Statement> generateStratumRecompute(
             const ast::RelationSet& scc, std::size_t sccNumber, bool publish) const;
 
+    /**
+     * The set of SCC indices that may use the O(diff) delta path instead of an O(|R|) recompute, even in a
+     * non-monotone program. A stratum is delta-eligible iff it is non-recursive, its own clauses contain no
+     * negation and no aggregate (the delta machinery rewrites scans, not existence checks or aggregates), and
+     * every dependency hands it a precise small diff — i.e. each dependency is an EDB input or itself lies in a
+     * delta-eligible stratum. This is a closure over the stratum DAG, computed by a forward pass over the
+     * topological `sccOrdering` (dependencies precede dependents). EDB strata (no clauses, no dependencies) are
+     * trivially eligible — they publish their staged diff.
+     */
+    std::set<std::size_t> computeDeltaEligible(const std::vector<std::size_t>& sccOrdering) const;
+
     /** Report the two auxiliary columns to the IO directives so they are stripped on write. */
     void addAuxiliaryArity(
             const ast::Relation* relation, std::map<std::string, std::string>& directives) const override;

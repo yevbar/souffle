@@ -310,6 +310,57 @@ VecOwn<ram::Relation> UnitTranslator::createRamRelations(const std::vector<std::
     return ramRelations;
 }
 
+std::set<std::size_t> UnitTranslator::computeDeltaEligible(
+        const std::vector<std::size_t>& sccOrdering) const {
+    const ast::Program* program = context->getProgram();
+
+    // Map every relation's concrete name to its SCC index, so a clause-body dependency name can be resolved to
+    // the stratum that produces it.
+    std::map<std::string, std::size_t> sccOf;
+    for (std::size_t scc : sccOrdering) {
+        for (const ast::Relation* rel : context->getRelationsInSCC(scc)) {
+            sccOf[getConcreteRelationName(rel->getQualifiedName())] = scc;
+        }
+    }
+
+    // A stratum is "locally delta-able" iff it is non-recursive and no clause of any of its relations uses
+    // negation or an aggregate. (EDB strata have no clauses, so they pass trivially.)
+    auto localDeltaable = [&](std::size_t scc) {
+        if (context->isRecursiveSCC(scc)) {
+            return false;
+        }
+        bool clean = true;
+        for (const ast::Relation* rel : context->getRelationsInSCC(scc)) {
+            for (const auto* clause : program->getClauses(*rel)) {
+                visit(*clause, [&](const ast::Negation&) { clean = false; });
+                visit(*clause, [&](const ast::Aggregator&) { clean = false; });
+            }
+        }
+        return clean;
+    };
+
+    // Forward pass in topological order: a stratum is eligible iff it is locally delta-able AND every
+    // dependency stratum is already eligible (EDB strata, having no dependencies, become eligible first).
+    std::set<std::size_t> eligible;
+    for (std::size_t scc : sccOrdering) {
+        if (!localDeltaable(scc)) {
+            continue;
+        }
+        bool depsOk = true;
+        for (const auto& dep : stratumDependencies(context->getRelationsInSCC(scc))) {
+            auto it = sccOf.find(dep);
+            if (it == sccOf.end() || eligible.find(it->second) == eligible.end()) {
+                depsOk = false;
+                break;
+            }
+        }
+        if (depsOk) {
+            eligible.insert(scc);
+        }
+    }
+    return eligible;
+}
+
 Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& translationUnit) {
     // Build the normal program first; this also registers the per-stratum subroutines and sets `glb`.
     auto ramProgram = seminaive::UnitTranslator::generateProgram(translationUnit);
@@ -342,6 +393,13 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
     visit(*program, [&](const ast::Negation&) { monotone = false; });
     visit(*program, [&](const ast::Aggregator&) { monotone = false; });
 
+    // Per-stratum delta eligibility: even when the program is non-monotone overall, the strata in the
+    // EDB-fed negation/aggregate-free closure can still use the O(diff) delta path (their dependencies all hand
+    // them a precise small diff). A globally monotone program has every non-recursive intensional stratum
+    // eligible (preserving the original behaviour, including delta downstream of a recursive stratum that
+    // publishes); a non-monotone program upgrades just the closure.
+    const std::set<std::size_t> deltaEligible = computeDeltaEligible(sccOrdering);
+
     VecOwn<ram::Statement> body;
     for (std::size_t i = 0; i < sccOrdering.size(); i++) {
         std::size_t scc = sccOrdering.at(i);
@@ -365,9 +423,11 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
                 appendStmt(edb, generateSetDirty(sccRelations));
                 appendStmt(body, guardStratum(mk<ram::Sequence>(std::move(edb)),
                                          {diffPlusName(rel), diffMinusName(rel)}));
-            } else if (monotone) {
-                // Monotone intensional: deletion (DRed) then insertion (delta); the delta itself populates
-                // diff_plus/diff_minus, and __dirty signals downstream.
+            } else if (monotone || deltaEligible.count(scc)) {
+                // Delta-eligible intensional: deletion (DRed) then insertion (delta); the delta itself
+                // populates diff_plus/diff_minus (the precise diff its downstream eligible strata consume), and
+                // __dirty signals downstream. Used for every non-recursive intensional stratum of a monotone
+                // program, and for the EDB-fed negation/aggregate-free closure of a non-monotone one.
                 VecOwn<ram::Statement> idb;
                 appendStmt(idb, generateIncrementalDelete(*rel));
                 appendStmt(idb, generateIncrementalNonRecursive(*rel));
@@ -375,7 +435,9 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
                 appendStmt(body, guardStratum(mk<ram::Sequence>(std::move(idb)),
                                          stratumSignals(sccRelations)));
             } else {
-                // Non-monotone (negation): recompute so sign-flips are retracted correctly (sets __dirty).
+                // Non-eligible intensional (negation/aggregate in its own clauses, or downstream of a recompute
+                // stratum): recompute so sign-flips are retracted correctly (sets __dirty). No eligible stratum
+                // depends on it, so it need not publish a precise diff.
                 appendStmt(body, guardStratum(generateStratumRecompute(sccRelations, scc, /* publish */ false),
                                          stratumSignals(sccRelations)));
             }
