@@ -117,6 +117,29 @@ struct DeltaRewriter : public ram::NodeMapper {
     }
 };
 
+// Strips souffle's emptiness-check OPTIMIZATION guards — `Filter(Negation(EmptinessCheck(R)), op)` ("run op
+// only if R is non-empty") — by replacing them with `op`. The guard names the body atom's ORIGINAL relation,
+// but a delta rule redirects that scan to a diff relation; when a deletion empties R the guard would wrongly
+// skip the over-delete (so the head is never retracted). Removing the guard is semantically a no-op (the scan
+// iterates an empty relation harmlessly) and the only cost is losing an early-out on a small diff rule.
+// A NEGATED atom is `Filter(Negation(ExistenceCheck(...)))` (ExistenceCheck, not EmptinessCheck) and a nullary
+// negation is `Filter(EmptinessCheck(...))` (no Negation) — neither matches, so both are preserved.
+struct EmptinessGuardStripper : public ram::NodeMapper {
+    Own<ram::Node> operator()(Own<ram::Node> node) const override {
+        if (const auto* filter = as<ram::Filter>(node.get())) {
+            if (const auto* neg = as<ram::Negation>(&filter->getCondition())) {
+                if (as<ram::EmptinessCheck>(&neg->getOperand()) != nullptr) {
+                    auto inner = clone(filter->getOperation());
+                    inner->apply(*this);
+                    return inner;
+                }
+            }
+        }
+        node->apply(*this);
+        return node;
+    }
+};
+
 // Wraps a clause's head Insert in a membership test against `diffMinus` (the over-deleted candidates of the
 // head relation), so re-derivation only re-adds tuples that were deletion candidates and still have support.
 // The data columns are matched by equality; the two auxiliary columns are supplied free (undef). For a nullary
@@ -272,6 +295,8 @@ Own<ram::Statement> UnitTranslator::generateDeltaRules(const ast::Relation& rel,
             auto version = clone(base);
             DeltaRewriter rewriter(i, scanPrefix, headPrefix);
             version->apply(rewriter);
+            EmptinessGuardStripper stripper;  // the redirected scan's old emptiness guard would mis-skip
+            version->apply(stripper);
             appendStmt(result, std::move(version));
         }
     }
