@@ -155,36 +155,26 @@ Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relatio
 
 Own<ram::Statement> UnitTranslator::generateIncrementalRecursive(
         const ast::RelationSet& scc, std::size_t sccNumber) const {
+    // Recompute the recursive stratum, handling insertions AND deletions. A diff-seeded fixpoint propagates
+    // insertions cheaply but does not retract tuples that lost support; getting both right inside a fixpoint
+    // is recursive DRed with re-discovery (future work). Instead: publish the old contents as deletions
+    // (into diff_minus), empty the relation, re-run the standard from-scratch fixpoint over the patched
+    // dependencies, then publish the new contents as insertions (into diff_plus). Correct for insert and
+    // delete; conservative for any downstream stratum (it sees the whole relation replaced, old->diff_minus
+    // and new->diff_plus, which its own update handles).
     VecOwn<ram::Statement> result;
 
-    // Seed each relation's @delta with the new tuples (delta rules using diff_plus of lower-stratum atoms;
-    // the version that ranges a same-SCC atom over its empty diff_plus is a harmless no-op), then merge the
-    // seed into the full relation.
+    // Old contents -> diff_minus (publish), then erase to empty the relation.
     for (const ast::Relation* rel : scc) {
-        appendStmt(result, generateDeltaRules(*rel, "diff_plus_", "@delta_", /* includeRecursive */ true));
-    }
-    for (const ast::Relation* rel : scc) {
-        appendStmt(result, generateMergeRelations(rel, getConcreteRelationName(rel->getQualifiedName()),
-                                   getDeltaRelationName(rel->getQualifiedName())));
+        const std::string mainName = getConcreteRelationName(rel->getQualifiedName());
+        appendStmt(result, generateMergeRelations(rel, diffMinusName(rel), mainName));
+        appendStmt(result, generateEraseAll(rel, mainName, diffMinusName(rel)));
     }
 
-    // The standard semi-naive fixpoint (mirrors generateRecursiveStratum, minus the from-scratch preamble) —
-    // driven by the seeded @delta, so the work is proportional to the seed.
-    auto joinSizeSequence = mk<ram::Sequence>(context->getRecursiveJoinSizeStatementsInSCC(sccNumber));
-    const std::string loopCounter = "loop_counter";
-    VecOwn<ram::Expression> inc;
-    inc.push_back(mk<ram::Variable>(loopCounter));
-    inc.push_back(mk<ram::UnsignedConstant>(1));
-    auto incrementCounter = mk<ram::Assign>(mk<ram::Variable>(loopCounter),
-            mk<ram::IntrinsicOperator>(FunctorOp::UADD, std::move(inc)), false);
-    auto fixpointLoop = mk<ram::Loop>(mk<ram::Sequence>(generateStratumLoopBody(scc),
-            std::move(joinSizeSequence), generateStratumExitSequence(scc), generateStratumTableUpdates(scc),
-            std::move(incrementCounter)));
-    appendStmt(result, mk<ram::Assign>(mk<ram::Variable>(loopCounter), mk<ram::UnsignedConstant>(1), true));
-    appendStmt(result, std::move(fixpointLoop));
-    appendStmt(result, generateStratumPostamble(scc));
+    // Re-run the standard from-scratch recursive stratum over the (already patched) dependencies.
+    appendStmt(result, generateRecursiveStratum(scc, sccNumber));
 
-    // Conservatively publish the relations into their diff_plus so downstream strata see the changes.
+    // New contents -> diff_plus (publish) for downstream strata.
     for (const ast::Relation* rel : scc) {
         appendStmt(result, generateMergeRelations(
                                    rel, diffPlusName(rel), getConcreteRelationName(rel->getQualifiedName())));
