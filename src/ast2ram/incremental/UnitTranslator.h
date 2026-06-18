@@ -70,21 +70,20 @@ private:
             const std::string& headPrefix, bool includeRecursive) const;
 
     /**
-     * Emit the OVER-DELETE (DRed candidate) rules for one relation, correct for SIMULTANEOUS multi-atom
-     * deletion. A head tuple must be over-deleted if it was derivable in the OLD database using at least one
-     * now-deleted body fact. The per-atom delta rules (generateDeltaRules over diff_minus) only catch a single
-     * deleted atom while reading the OTHERS over their already-updated (new) state, so they MISS a head that
-     * loses two body facts at once. This instead enumerates every NON-EMPTY subset of the deletable body atoms
-     * (data-carrying scans + positive nullary atoms): the subset's atoms range over their diff_minus, the rest
-     * over their current relation. The union over subsets equals the join over the OLD relations restricted to
-     * ≥1 deletion — the exact deletion delta. Bounded to small bodies by computeDeltaEligible (2^k-1 versions);
-     * larger-bodied relations recompute instead.
+     * The dependency relations that appear as POSITIVE body atoms in `rel`'s non-recursive clauses — the ones
+     * whose deletion can over-delete `rel`, and whose OLD state the over-delete must read (negated atoms are
+     * excluded; they are handled by generateNegationOverDelete over current state).
      */
-    Own<ram::Statement> generateOverDeleteRules(const ast::Relation& rel) const;
+    std::vector<const ast::Relation*> positiveDeleteDeps(const ast::Relation& rel) const;
 
-    /** Max deletable body atoms (scans + positive nullary atoms) over a stratum's clauses — bounds the
-     * over-delete subset enumeration. A stratum is delta-eligible only if this is at most kOverDeleteAtomCap. */
-    std::size_t maxDeletableBodyAtoms(const ast::RelationSet& scc) const;
+    /**
+     * `dest := { t in src : t.data NOT in other }` — a set difference on DATA-column identity (the @iteration aux
+     * column is supplied free in the membership test and copied verbatim). For a nullary relation, data identity
+     * is mere presence, so the condition becomes "other is empty". Used by the over-delete merge-back to stage a
+     * dependency's truly-deleted tuples (diff_minus_d \ d) into its @swap scratch.
+     */
+    Own<ram::Statement> generateSetDifference(const std::string& src, const std::string& other,
+            const std::string& dest, std::size_t arity) const;
 
     /** Erase every tuple of `srcRelation` (all columns incl. auxiliary) from `destRelation`. */
     Own<ram::Statement> generateEraseAll(
