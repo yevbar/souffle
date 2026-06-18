@@ -69,6 +69,23 @@ private:
     Own<ram::Statement> generateDeltaRules(const ast::Relation& rel, const std::string& scanPrefix,
             const std::string& headPrefix, bool includeRecursive) const;
 
+    /**
+     * Emit the OVER-DELETE (DRed candidate) rules for one relation, correct for SIMULTANEOUS multi-atom
+     * deletion. A head tuple must be over-deleted if it was derivable in the OLD database using at least one
+     * now-deleted body fact. The per-atom delta rules (generateDeltaRules over diff_minus) only catch a single
+     * deleted atom while reading the OTHERS over their already-updated (new) state, so they MISS a head that
+     * loses two body facts at once. This instead enumerates every NON-EMPTY subset of the deletable body atoms
+     * (data-carrying scans + positive nullary atoms): the subset's atoms range over their diff_minus, the rest
+     * over their current relation. The union over subsets equals the join over the OLD relations restricted to
+     * ≥1 deletion — the exact deletion delta. Bounded to small bodies by computeDeltaEligible (2^k-1 versions);
+     * larger-bodied relations recompute instead.
+     */
+    Own<ram::Statement> generateOverDeleteRules(const ast::Relation& rel) const;
+
+    /** Max deletable body atoms (scans + positive nullary atoms) over a stratum's clauses — bounds the
+     * over-delete subset enumeration. A stratum is delta-eligible only if this is at most kOverDeleteAtomCap. */
+    std::size_t maxDeletableBodyAtoms(const ast::RelationSet& scc) const;
+
     /** Erase every tuple of `srcRelation` (all columns incl. auxiliary) from `destRelation`. */
     Own<ram::Statement> generateEraseAll(
             const ast::Relation* rel, const std::string& destRelation, const std::string& srcRelation) const;

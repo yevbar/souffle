@@ -236,6 +236,64 @@ struct NullaryAtomRewriter : public ram::NodeMapper {
     }
 };
 
+// Over-delete subset rewriter: redirects the scans whose index is in `scanTargets` AND the positive nullary body
+// atoms whose index is in `nullaryTargets` to range over their diff (`<scanPrefix><R>`), leaving every other body
+// atom on its current relation; redirects every head Insert to `<headPrefix><head>`. Generating one version per
+// non-empty subset (generateOverDeleteRules) computes the deletion delta as the join over the OLD database, which
+// is what catches a head tuple losing support from several body atoms SIMULTANEOUSLY. Generalises DeltaRewriter
+// (single scan) + NullaryAtomRewriter (single nullary atom) to a SET of each. Scan / nullary indices are assigned
+// in pre-order, matching the counting visit in generateOverDeleteRules.
+struct SubsetDeltaRewriter : public ram::NodeMapper {
+    const std::set<std::size_t>& scanTargets;
+    const std::set<std::size_t>& nullaryTargets;
+    std::string scanPrefix;
+    std::string headPrefix;
+    const std::set<std::string>& scanned;
+    mutable std::size_t scanIdx = 0;
+    mutable std::size_t nullaryIdx = 0;
+    SubsetDeltaRewriter(const std::set<std::size_t>& scanTargets, const std::set<std::size_t>& nullaryTargets,
+            std::string scanPrefix, std::string headPrefix, const std::set<std::string>& scanned)
+            : scanTargets(scanTargets), nullaryTargets(nullaryTargets), scanPrefix(std::move(scanPrefix)),
+              headPrefix(std::move(headPrefix)), scanned(scanned) {}
+
+    Own<ram::Node> operator()(Own<ram::Node> node) const override {
+        if (const auto* scan = as<ram::Scan>(node.get())) {
+            std::size_t idx = scanIdx++;
+            node->apply(*this);  // rewrite nested operations first
+            if (scanTargets.count(idx) != 0u) {
+                return mk<ram::Scan>(scanPrefix + scan->getRelation(), scan->getTupleId(),
+                        clone(scan->getOperation()), "");
+            }
+            return node;
+        }
+        if (const auto* filter = as<ram::Filter>(node.get())) {
+            if (!nullaryAtomOf(filter, scanned).empty()) {
+                std::size_t idx = nullaryIdx++;
+                if (nullaryTargets.count(idx) != 0u) {
+                    // Dispatch on the operation itself so an Insert directly below still gets its head renamed.
+                    Own<ram::Node> innerNode = (*this)(clone(filter->getOperation()));
+                    Own<ram::Operation> inner(as<ram::Operation>(innerNode.release()));
+                    return mk<ram::Filter>(
+                            mk<ram::Negation>(mk<ram::EmptinessCheck>(scanPrefix + nullaryAtomOf(filter, scanned))),
+                            std::move(inner));
+                }
+                node->apply(*this);  // non-target nullary: keep, but recurse to rename the head Insert
+                return node;
+            }
+        }
+        if (const auto* insert = as<ram::Insert>(node.get())) {
+            node->apply(*this);
+            VecOwn<ram::Expression> values;
+            for (const auto* value : insert->getValues()) {
+                values.push_back(clone(value));
+            }
+            return mk<ram::Insert>(headPrefix + insert->getRelation(), std::move(values));
+        }
+        node->apply(*this);
+        return node;
+    }
+};
+
 // Wraps a clause's head Insert in a membership test against `diffMinus` (the over-deleted candidates of the
 // head relation), so re-derivation only re-adds tuples that were deletion candidates and still have support.
 // The data columns are matched by equality; the two auxiliary columns are supplied free (undef). For a nullary
@@ -418,6 +476,88 @@ Own<ram::Statement> UnitTranslator::generateDeltaRules(const ast::Relation& rel,
     return mk<ram::Sequence>(std::move(result));
 }
 
+// The over-delete subset-enumeration cap: a delta-eligible clause may have at most this many deletable body
+// atoms, so the 2^k-1 over-delete versions stay bounded. Larger-bodied relations recompute instead (see
+// computeDeltaEligible). 6 -> at most 63 versions per clause.
+static constexpr std::size_t kOverDeleteAtomCap = 6;
+
+Own<ram::Statement> UnitTranslator::generateOverDeleteRules(const ast::Relation& rel) const {
+    VecOwn<ram::Statement> result;
+    for (auto&& clause : context->getProgram()->getClauses(rel)) {
+        if (isA<ast::SubsumptiveClause>(clause)) {
+            continue;
+        }
+        if (context->isRecursiveClause(clause)) {
+            continue;  // recursive clauses are handled by recompute, not the delta path
+        }
+        auto base = context->translateNonRecursiveClause(*clause);
+        std::set<std::string> scanned;
+        std::size_t numScans = 0;
+        visit(*base, [&](const ram::Scan& s) {
+            scanned.insert(s.getRelation());
+            numScans++;
+        });
+        std::size_t numNullary = 0;
+        visit(*base, [&](const ram::Filter& f) {
+            if (!nullaryAtomOf(&f, scanned).empty()) {
+                numNullary++;
+            }
+        });
+        std::size_t total = numScans + numNullary;
+        if (total == 0) {
+            continue;  // a fact-only clause has no deletable body atom
+        }
+        // Enumerate every non-empty subset of the `total` deletable atoms: bits [0,numScans) select scans,
+        // bits [numScans,total) select positive nullary atoms. Each subset's atoms range over their diff_minus.
+        for (std::size_t mask = 1; mask < (1u << total); mask++) {
+            std::set<std::size_t> scanTargets;
+            std::set<std::size_t> nullaryTargets;
+            for (std::size_t i = 0; i < numScans; i++) {
+                if ((mask & (1u << i)) != 0u) {
+                    scanTargets.insert(i);
+                }
+            }
+            for (std::size_t j = 0; j < numNullary; j++) {
+                if ((mask & (1u << (numScans + j))) != 0u) {
+                    nullaryTargets.insert(j);
+                }
+            }
+            auto version = clone(base);
+            SubsetDeltaRewriter rewriter(scanTargets, nullaryTargets, "diff_minus_", "diff_minus_", scanned);
+            version->apply(rewriter);
+            EmptinessGuardStripper stripper(scanned);  // a redirected scan's old emptiness guard would mis-skip
+            version->apply(stripper);
+            appendStmt(result, std::move(version));
+        }
+    }
+    return mk<ram::Sequence>(std::move(result));
+}
+
+std::size_t UnitTranslator::maxDeletableBodyAtoms(const ast::RelationSet& scc) const {
+    std::size_t worst = 0;
+    for (const ast::Relation* rel : scc) {
+        for (auto&& clause : context->getProgram()->getClauses(*rel)) {
+            if (isA<ast::SubsumptiveClause>(clause) || context->isRecursiveClause(clause)) {
+                continue;
+            }
+            auto base = context->translateNonRecursiveClause(*clause);
+            std::set<std::string> scanned;
+            std::size_t n = 0;
+            visit(*base, [&](const ram::Scan& s) {
+                scanned.insert(s.getRelation());
+                n++;
+            });
+            visit(*base, [&](const ram::Filter& f) {
+                if (!nullaryAtomOf(&f, scanned).empty()) {
+                    n++;
+                }
+            });
+            worst = std::max(worst, n);
+        }
+    }
+    return worst;
+}
+
 // Erase from `destRelation` every tuple in `srcRelation`, copying all columns (data + the two auxiliary
 // columns). The relation keys on the data columns, so the auxiliary values supplied do not affect the match.
 Own<ram::Statement> UnitTranslator::generateEraseAll(
@@ -595,7 +735,10 @@ Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relatio
         // variables, a single conservative candidate is correct and handles any combination of deletions.
         appendStmt(result, generateNullaryOverDelete(rel));
     } else {
-        appendStmt(result, generateDeltaRules(rel, "diff_minus_", "diff_minus_", /* includeRecursive */ false));
+        // Over-delete candidates, CORRECT for simultaneous multi-atom deletion (subset enumeration over the
+        // deletable body atoms — see generateOverDeleteRules). Supersedes the per-atom-only generateDeltaRules,
+        // which missed a head losing two body facts at once.
+        appendStmt(result, generateOverDeleteRules(rel));
         // Negation sign-flips: a negated atom that just became TRUE also over-deletes (its candidates join the
         // positive ones in diff_minus_<H> before the erase). A no-op for negation-free relations.
         appendStmt(result, generateNegationOverDelete(rel));
@@ -731,10 +874,11 @@ std::set<std::size_t> UnitTranslator::computeDeltaEligible(
         }
     }
 
-    // A stratum is "locally delta-able" iff it is non-recursive and no clause of any of its relations uses an
-    // aggregate. Negation IS supported now (the negation-delta rules seed the three-term update from sign
-    // flips); aggregates still force a recompute (they must see the whole relation). EDB strata have no
-    // clauses, so they pass trivially.
+    // A stratum is "locally delta-able" iff it is non-recursive, no clause of any of its relations uses an
+    // aggregate, AND no clause has more than kOverDeleteAtomCap deletable body atoms (so the over-delete subset
+    // enumeration stays bounded — larger bodies recompute). Negation IS supported (the negation-delta rules seed
+    // the three-term update from sign flips); aggregates still force a recompute (they must see the whole
+    // relation). EDB strata have no clauses, so they pass trivially.
     auto localDeltaable = [&](std::size_t scc) {
         if (context->isRecursiveSCC(scc)) {
             return false;
@@ -745,7 +889,10 @@ std::set<std::size_t> UnitTranslator::computeDeltaEligible(
                 visit(*clause, [&](const ast::Aggregator&) { clean = false; });
             }
         }
-        return clean;
+        if (!clean) {
+            return false;
+        }
+        return maxDeletableBodyAtoms(context->getRelationsInSCC(scc)) <= kOverDeleteAtomCap;
     };
 
     // Forward pass in topological order: a stratum is eligible iff it is locally delta-able AND every
