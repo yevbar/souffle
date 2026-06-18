@@ -125,6 +125,15 @@ private:
      */
     std::set<std::size_t> computeDeltaEligible(const std::vector<std::size_t>& sccOrdering) const;
 
+    /**
+     * Re-derive ONLY the over-deleted candidates (the tuples in `diff_minus_<rel>`), not the whole relation.
+     * Each non-recursive clause is translated normally, then its head Insert is wrapped in a membership test
+     * against `diff_minus_<rel>` so a tuple is re-added iff it was a deletion candidate AND still has support.
+     * This is the DRed re-derivation restricted to candidates — O(|diff_minus|·body) instead of O(|rel|·body),
+     * and a no-op when there are no deletions (insertion-only updates), making the delta path truly O(diff).
+     */
+    Own<ram::Statement> generateRederiveCandidates(const ast::Relation& rel) const;
+
     /** Report the two auxiliary columns to the IO directives so they are stripped on write. */
     void addAuxiliaryArity(
             const ast::Relation* relation, std::map<std::string, std::string>& directives) const override;

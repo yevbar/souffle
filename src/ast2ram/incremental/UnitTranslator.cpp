@@ -33,10 +33,13 @@
 #include "ram/EmptinessCheck.h"
 #include "ram/Erase.h"
 #include "ram/Exit.h"
+#include "ram/ExistenceCheck.h"
+#include "ram/Filter.h"
 #include "ram/Insert.h"
 #include "ram/IntrinsicOperator.h"
 #include "ram/Loop.h"
 #include "ram/MergeExtend.h"
+#include "ram/Negation.h"
 #include "ram/Node.h"
 #include "ram/Query.h"
 #include "ram/Relation.h"
@@ -46,6 +49,7 @@
 #include "ram/Swap.h"
 #include "ram/True.h"
 #include "ram/TupleElement.h"
+#include "ram/UndefValue.h"
 #include "ram/UnsignedConstant.h"
 #include "ram/Variable.h"
 #include "ram/utility/Visitor.h"
@@ -107,6 +111,38 @@ struct DeltaRewriter : public ram::NodeMapper {
                 values.push_back(clone(value));
             }
             return mk<ram::Insert>(headPrefix + insert->getRelation(), std::move(values));
+        }
+        node->apply(*this);
+        return node;
+    }
+};
+
+// Wraps a clause's head Insert in a membership test against `diffMinus` (the over-deleted candidates of the
+// head relation), so re-derivation only re-adds tuples that were deletion candidates and still have support.
+// The data columns are matched by equality; the two auxiliary columns are supplied free (undef). For a nullary
+// head, membership is a non-emptiness check on `diffMinus`.
+struct RederiveRestrictor : public ram::NodeMapper {
+    std::string diffMinus;
+    explicit RederiveRestrictor(std::string diffMinus) : diffMinus(std::move(diffMinus)) {}
+
+    Own<ram::Node> operator()(Own<ram::Node> node) const override {
+        if (const auto* insert = as<ram::Insert>(node.get())) {
+            const auto& iv = insert->getValues();
+            // iv = [data..., @count, @iteration]; the last two are auxiliary.
+            Own<ram::Condition> cond;
+            if (iv.size() <= 2) {
+                // nullary head: re-derive only if the candidate flag (diff_minus) is non-empty.
+                cond = mk<ram::Negation>(mk<ram::EmptinessCheck>(diffMinus));
+            } else {
+                VecOwn<ram::Expression> values;
+                for (std::size_t i = 0; i + 2 < iv.size(); i++) {
+                    values.push_back(clone(iv[i]));
+                }
+                values.push_back(mk<ram::UndefValue>());  // @count: free
+                values.push_back(mk<ram::UndefValue>());  // @iteration: free
+                cond = mk<ram::ExistenceCheck>(diffMinus, std::move(values));
+            }
+            return mk<ram::Filter>(std::move(cond), clone(insert));
         }
         node->apply(*this);
         return node;
@@ -209,18 +245,37 @@ Own<ram::Statement> UnitTranslator::generateIncrementalNonRecursive(const ast::R
     return mk<ram::Sequence>(std::move(result));
 }
 
+Own<ram::Statement> UnitTranslator::generateRederiveCandidates(const ast::Relation& rel) const {
+    VecOwn<ram::Statement> result;
+    const std::string diffMinus = getConcreteRelationName(rel.getQualifiedName(), "diff_minus_");
+    for (auto&& clause : context->getProgram()->getClauses(rel)) {
+        if (isA<ast::SubsumptiveClause>(clause)) {
+            continue;
+        }
+        if (context->isRecursiveClause(clause)) {
+            continue;
+        }
+        auto version = context->translateNonRecursiveClause(*clause);
+        RederiveRestrictor restrictor(diffMinus);
+        version->apply(restrictor);
+        appendStmt(result, std::move(version));
+    }
+    return mk<ram::Sequence>(std::move(result));
+}
+
 Own<ram::Statement> UnitTranslator::generateIncrementalDelete(const ast::Relation& rel) const {
     // DRed-style deletion for a non-recursive relation:
     //   1. over-delete: the delta rules over diff_minus of dependencies compute the candidate deletions into
     //      diff_minus_<R> (tuples derived using a now-deleted tuple);
     //   2. erase those candidates from <R>;
-    //   3. re-derive <R> from the surviving relations — re-adds any candidate that still has support, and is a
-    //      no-op (set dedup) for the untouched tuples. Sound for monotone programs.
+    //   3. re-derive ONLY the candidates from the surviving relations — re-adds any candidate that still has
+    //      support, restricted to the diff_minus_<R> tuples so the cost is O(|diff_minus|) not O(|R|). A no-op
+    //      when there are no deletions (diff_minus empty), which is what makes an insertion-only update O(diff).
     VecOwn<ram::Statement> result;
     appendStmt(result, generateDeltaRules(rel, "diff_minus_", "diff_minus_", /* includeRecursive */ false));
     appendStmt(result, generateEraseAll(&rel, getConcreteRelationName(rel.getQualifiedName()),
                                getConcreteRelationName(rel.getQualifiedName(), "diff_minus_")));
-    appendStmt(result, generateNonRecursiveRelation(rel));
+    appendStmt(result, generateRederiveCandidates(rel));
     return mk<ram::Sequence>(std::move(result));
 }
 
