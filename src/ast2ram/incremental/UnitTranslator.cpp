@@ -248,9 +248,14 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
         } else if (!sccRelations.empty()) {
             const ast::Relation* rel = *sccRelations.begin();
             if (program->getClauses(*rel).empty()) {
+                // Extensional: erase the staged deletions, then merge the staged insertions.
+                appendStmt(body, generateEraseAll(rel, getConcreteRelationName(rel->getQualifiedName()),
+                                         diffMinusName(rel)));
                 appendStmt(body, generateMergeRelations(rel,
                                          getConcreteRelationName(rel->getQualifiedName()), diffPlusName(rel)));
             } else if (monotone) {
+                // Deletion (DRed) then insertion (delta).
+                appendStmt(body, generateIncrementalDelete(*rel));
                 appendStmt(body, generateIncrementalNonRecursive(*rel));
             } else {
                 appendStmt(body, generateNonRecursiveRelation(*rel));
@@ -279,6 +284,12 @@ Own<ram::Relation> UnitTranslator::createRamRelation(const ast::Relation* baseRe
 
     attributeNames.push_back("@iteration");
     attributeTypeQualifiers.push_back("i:number");
+
+    // The incremental update erases tuples (DRed deletion), which the default btree representation does not
+    // support — use the deletion-capable btree. Leave non-default representations (e.g. EQREL) untouched.
+    if (representation == RelationRepresentation::DEFAULT || representation == RelationRepresentation::BTREE) {
+        representation = RelationRepresentation::BTREE_DELETE;
+    }
 
     return mk<ram::Relation>(ramRelationName, arity + 2, auxiliaryArity + 2, attributeNames,
             attributeTypeQualifiers, representation);

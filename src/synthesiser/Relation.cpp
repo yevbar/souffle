@@ -51,7 +51,10 @@ Own<Relation> Relation::getSynthesiserRelation(
     bool hasProvenance = ramRel.getArity() > 0 && ramRel.getAttributeNames().back() == "@level_number";
     // Handle the qualifier in souffle code
     if (ramRel.getAuxiliaryArity() > 0) {
-        rel = new DirectRelation(ramRel, indexSelection, true, hasProvenance, false);
+        // Auxiliary-arity relations marked BTREE_DELETE still need the deletion-capable structure (the
+        // incremental strategy adds @count/@iteration auxiliary columns and erases tuples for DRed deletion).
+        bool isDelete = ramRel.getRepresentation() == RelationRepresentation::BTREE_DELETE;
+        rel = new DirectRelation(ramRel, indexSelection, true, hasProvenance, isDelete);
     } else if (ramRel.isNullary()) {
         rel = new NullaryRelation(ramRel, indexSelection);
     } else if (ramRel.getRepresentation() == RelationRepresentation::BTREE) {
@@ -349,7 +352,11 @@ void DirectRelation::generateTypeStruct(GenDb& db) {
                 // index for top down phase
                 comparator_aux = comparator;
             }
-            decl << "using t_ind_" << i << " = btree_set<t_tuple," << comparator
+            // btree_delete_set has the same template signature as btree_set, so the deletion-capable
+            // structure composes with the auxiliary-column comparator/updater (needed for DRed deletion on
+            // the incremental strategy's @count/@iteration relations).
+            std::string btree_name = hasErase ? "btree_delete_set" : "btree_set";
+            decl << "using t_ind_" << i << " = " << btree_name << "<t_tuple," << comparator
                  << ",std::allocator<t_tuple>,256,typename "
                     "souffle::detail::default_strategy<t_tuple>::type,"
                  << comparator_aux << ",updater>;\n";
