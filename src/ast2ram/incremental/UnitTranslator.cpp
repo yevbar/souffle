@@ -16,6 +16,7 @@
 
 #include "ast2ram/incremental/UnitTranslator.h"
 #include "RelationTag.h"
+#include "ast/Aggregator.h"
 #include "ast/Clause.h"
 #include "ast/Negation.h"
 #include "ast/Program.h"
@@ -275,8 +276,12 @@ Own<ram::Sequence> UnitTranslator::generateProgram(const ast::TranslationUnit& t
             translationUnit.getAnalysis<ast::analysis::TopologicallySortedSCCGraphAnalysis>().order();
     const ast::Program* program = context->getProgram();
 
+    // Monotone = no construct whose result can DECREASE when an input grows. Negation and aggregates both
+    // qualify (inserting a fact can falsify a negation or lower/raise an aggregate, retracting derived
+    // tuples), so a program using either is recomputed rather than delta-updated.
     bool monotone = true;
     visit(*program, [&](const ast::Negation&) { monotone = false; });
+    visit(*program, [&](const ast::Aggregator&) { monotone = false; });
 
     VecOwn<ram::Statement> body;
     for (std::size_t i = 0; i < sccOrdering.size(); i++) {
